@@ -1,0 +1,7 @@
+{"bos_token": "<BOS>", "eos_token": "<EOS>", "add_generation_prompt": true,
+ "messages": [
+  {"role": "system", "content": "You are a helpful assistant."},
+  {"role": "user", "content": "Hello there!"},
+  {"role": "assistant", "content": "Hi! How can I help?"},
+  {"role": "user", "content": "What's the weather in Paris?\nThanks."}
+ ]}

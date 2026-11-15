@@ -1,0 +1,2 @@
+# Test data must match byte-for-byte (template outputs, reference values): never convert line endings.
+tests/Lamma.Net.Tests/TestData/** -text

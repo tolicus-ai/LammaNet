@@ -1,0 +1,30 @@
+namespace LammaNet.Templates.Jinja;
+
+internal abstract record Node;
+internal sealed record TextNode(string Text) : Node;
+internal sealed record OutputNode(Expr Expr) : Node;
+internal sealed record IfNode(List<(Expr Cond, List<Node> Body)> Branches, List<Node>? Else) : Node;
+internal sealed record ForNode(List<string> Targets, Expr Iter, Expr? Filter, List<Node> Body, List<Node>? Else) : Node;
+internal sealed record SetNode(List<Expr> Targets, Expr Value) : Node;
+internal sealed record SetBlockNode(Expr Target, List<Node> Body, List<(string Name, List<Expr> Args)> Filters) : Node;
+internal sealed record MacroNode(string Name, List<(string Name, Expr? Default)> Params, List<Node> Body) : Node;
+internal sealed record FilterBlockNode(List<(string Name, List<Expr> Args)> Filters, List<Node> Body) : Node;
+internal sealed record DoNode(Expr Expr) : Node;
+internal sealed record BreakNode : Node;
+internal sealed record ContinueNode : Node;
+
+internal abstract record Expr;
+internal sealed record ConstExpr(object? Value) : Expr;
+internal sealed record NameExpr(string Name) : Expr;
+internal sealed record ListExpr(List<Expr> Items) : Expr;
+internal sealed record TupleExpr(List<Expr> Items) : Expr;
+internal sealed record DictExpr(List<(Expr Key, Expr Value)> Items) : Expr;
+internal sealed record AttrExpr(Expr Target, string Name) : Expr;
+internal sealed record ItemExpr(Expr Target, Expr Index) : Expr;
+internal sealed record SliceExpr(Expr Target, Expr? Start, Expr? Stop, Expr? Step) : Expr;
+internal sealed record CallExpr(Expr Func, List<Expr> Args, List<(string Name, Expr Value)> Kwargs) : Expr;
+internal sealed record FilterExpr(Expr Target, string Name, List<Expr> Args, List<(string Name, Expr Value)> Kwargs) : Expr;
+internal sealed record TestExpr(Expr Target, string Name, List<Expr> Args, bool Negated) : Expr;
+internal sealed record UnaryExpr(string Op, Expr Operand) : Expr;
+internal sealed record BinaryExpr(string Op, Expr Left, Expr Right) : Expr;
+internal sealed record CondExpr(Expr Test, Expr Then, Expr? Else) : Expr;

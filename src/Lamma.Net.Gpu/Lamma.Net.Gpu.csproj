@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>LammaNet.Gpu</RootNamespace>
+    <AssemblyName>Lamma.Net.Gpu</AssemblyName>
+    <Description>GPU offloading for Lamma.Net via ILGPU (pure C# kernels compiled to CUDA PTX at runtime): run all or the first N layers on an NVIDIA GPU and the rest on the CPU.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Lamma.Net\Lamma.Net.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ILGPU" Version="1.5.3" />
+    <PackageReference Include="ILGPU.Algorithms" Version="1.5.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lamma.Net.Tests" />
+  </ItemGroup>
+
+</Project>

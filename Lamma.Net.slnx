@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Lamma.Net/Lamma.Net.csproj" />
+    <Project Path="src/Lamma.Net.Extensions.AI/Lamma.Net.Extensions.AI.csproj" />
+    <Project Path="src/Lamma.Net.Gpu/Lamma.Net.Gpu.csproj" />
+    <Project Path="src/Lamma.Net.Cli/Lamma.Net.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Lamma.Net.Tests/Lamma.Net.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,6 @@
+{"bos_token": "<BOS>", "eos_token": "<EOS>", "add_generation_prompt": true, "enable_thinking": false,
+ "messages": [
+  {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe this picture."}]},
+  {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nA cat."},
+  {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "And transcribe this."}]}
+ ]}

@@ -1,0 +1,9 @@
+<BOS><|turn>system
+<|tool>declaration:get_weather{description:<|"|>Get current weather for a city<|"|>,parameters:{properties:{city:{description:<|"|>City name<|"|>,type:<|"|>STRING<|"|>},unit:{enum:[<|"|>c<|"|>,<|"|>f<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>city<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Weather in Paris?<turn|>
+<|turn>model
+<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,unit:<|"|>c<|"|>}<tool_call|><|tool_response>response:get_weather{value:<|"|>{"temp": 21}<|"|>}<tool_response|>It is 21C in Paris.<turn|>
+<|turn>user
+And London?<turn|>
+<|turn>model

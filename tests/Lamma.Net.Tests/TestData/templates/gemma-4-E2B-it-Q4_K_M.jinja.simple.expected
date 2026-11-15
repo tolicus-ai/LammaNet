@@ -1,0 +1,10 @@
+<BOS><|turn>system
+You are a helpful assistant.<turn|>
+<|turn>user
+Hello there!<turn|>
+<|turn>model
+Hi! How can I help?<turn|>
+<|turn>user
+What's the weather in Paris?
+Thanks.<turn|>
+<|turn>model

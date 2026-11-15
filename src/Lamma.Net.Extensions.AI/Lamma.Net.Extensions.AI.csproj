@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>LammaNet.Extensions.AI</RootNamespace>
+    <AssemblyName>Lamma.Net.Extensions.AI</AssemblyName>
+    <Description>Microsoft.Extensions.AI bindings (IChatClient, IEmbeddingGenerator, ISpeechToTextClient, IRealtimeClient) for the Lamma.Net in-process inference engine.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);MEAI001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Lamma.Net\Lamma.Net.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.10.1" />
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.10.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lamma.Net.Tests" />
+  </ItemGroup>
+
+</Project>
