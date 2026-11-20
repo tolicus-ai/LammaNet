@@ -47,8 +47,18 @@ public class JinjaTests
     [InlineData("{% for k, v in {'x': 1, 'y': 2} | dictsort %}{{ k }}={{ v }};{% endfor %}", "x=1;y=2;")]
     [InlineData("{{ x is defined }} {{ y | default('d') }}", "False d")]
     [InlineData("{%- for i in range(3) -%}{%- if i == 1 -%}{%- continue -%}{%- endif -%}{{ i }}{%- endfor -%}", "02")]
+    [InlineData("{{ x is sequence }}{{ x is iterable }}{{ x is mapping }}[{% for i in x %}{{ i }}{% endfor %}]", "TrueTrueFalse[]")]
     public void Expressions(string template, string expected)
     {
         Assert.Equal(expected, new JinjaTemplate(template).Render(new Dictionary<string, object?>()));
+    }
+
+    [Fact]
+    public void JsonNodeArguments_BecomeJinjaValues()
+    {
+        var args = System.Text.Json.Nodes.JsonNode.Parse("""{"city": "Paris", "days": [1, 2.5, true, null], "nested": {"k": "v"}}""");
+        const string template = "{{ a.city }}|{% for d in a.days %}{{ d }},{% endfor %}|{{ a.nested.k }}|{{ a.days is sequence }}|{{ a | tojson }}";
+        Assert.Equal("""Paris|1,2.5,True,None,|v|True|{"city": "Paris", "days": [1, 2.5, true, null], "nested": {"k": "v"}}""",
+            new JinjaTemplate(template).Render(new Dictionary<string, object?> { ["a"] = args }));
     }
 }

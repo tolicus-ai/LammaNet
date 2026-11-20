@@ -368,8 +368,8 @@ internal static class Builtins
             case "true": return v is true;
             case "false": return v is false;
             case "mapping": return v is JinjaDict or JinjaNamespace;
-            case "sequence": return v is string or IList or JinjaDict;
-            case "iterable": return v is string or IList or JinjaDict;
+            case "sequence": return v is string or IList or JinjaDict or Undefined;
+            case "iterable": return v is string or IList or JinjaDict or Undefined;
             case "callable": return v is JinjaCallable;
             case "odd": return JinjaValue.ToLong(v) % 2 != 0;
             case "even": return JinjaValue.ToLong(v) % 2 == 0;

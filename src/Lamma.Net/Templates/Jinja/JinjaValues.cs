@@ -240,7 +240,12 @@ public static class JinjaValue
             case float f: return (double)f;
             case decimal m: return (double)m;
             case System.Text.Json.JsonElement je: return FromJson(je);
-            case System.Text.Json.Nodes.JsonNode jn: return FromJson(System.Text.Json.JsonSerializer.SerializeToElement(jn));
+            case System.Text.Json.Nodes.JsonNode jn:
+            {
+                // round trip through text: SerializeToElement needs reflection, which breaks under trimming/AOT
+                using var doc = System.Text.Json.JsonDocument.Parse(jn.ToJsonString());
+                return FromJson(doc.RootElement);
+            }
             case IDictionary<string, object?> d:
             {
                 var r = new JinjaDict();
@@ -276,7 +281,7 @@ public static class JinjaValue
             }
             case System.Text.Json.JsonValueKind.Array: return e.EnumerateArray().Select(FromJson).ToList();
             case System.Text.Json.JsonValueKind.String: return e.GetString();
-            case System.Text.Json.JsonValueKind.Number: return e.TryGetInt64(out var l) ? l : e.GetDouble();
+            case System.Text.Json.JsonValueKind.Number: return e.TryGetInt64(out var l) ? (object)l : e.GetDouble();
             case System.Text.Json.JsonValueKind.True: return true;
             case System.Text.Json.JsonValueKind.False: return false;
             default: return null;
