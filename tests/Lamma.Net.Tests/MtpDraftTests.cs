@@ -1,5 +1,6 @@
 using LammaNet.Chat;
 using LammaNet.Inference;
+using LammaNet.Memory;
 using LammaNet.Models;
 using LammaNet.Sampling;
 
@@ -35,7 +36,8 @@ public class MtpDraftTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task DraftedGenerationMatchesPlainGeneration(bool gpu)
+    [InlineData(true, KvCacheType.Q8_0)]
+    public async Task DraftedGenerationMatchesPlainGeneration(bool gpu, KvCacheType kvType = KvCacheType.F16)
     {
         var dp = TestModels.Find(Drafter);
         var tp = TestModels.Find(Target);
@@ -46,6 +48,7 @@ public class MtpDraftTests
             using var engine = InferenceEngine.Load(tp, new EngineOptions
             {
                 ContextSize = 1024, Threads = 4, AutoAccelerator = gpu, DraftModelPath = drafter, SpeculativeDraftTokens = drafter != null ? 2 : 0,
+                KvCacheType = kvType,
             });
             var chat = new ChatEngine(engine);
             var texts = new List<string>();

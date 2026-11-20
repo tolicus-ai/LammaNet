@@ -41,7 +41,15 @@ internal static partial class Kernels
     /// Grid: N × ceil(NHead / 4) × NChunks groups of 128.
     /// </summary>
     public static void AttnDecode(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
-        ArrayView<float> outp, ArrayView<float> part, AttnParams p)
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p) =>
+        AttnDecodeCore(q, kc, vc, pages, tokInfo, outp, part, p, 0);
+
+    internal static void AttnKvQ8(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p) =>
+        AttnDecodeCore(q, kc, vc, pages, tokInfo, outp, part, p, 1);
+
+    private static void AttnDecodeCore(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p, int compact)
     {
         var sh = SharedMemory.Allocate<float>(WarpsPerGroup * 2 * MaxHeadDim);
         var shp = SharedMemory.Allocate<float>(WarpsPerGroup * Warp);
@@ -63,8 +71,6 @@ internal static partial class Kernels
         int chunk = (end - start + p.NChunks) / p.NChunks;
         int p0 = start + c * chunk, p1 = p0 + chunk - 1;
         if (p1 > end) p1 = end;
-        var k8 = kc.Cast<Half8>();
-        var v2 = vc.Cast<Half2>();
         int vPairs = p.HdV >> 6; // Half2 loads per lane and position (lane owns dims 2·lane + 64·e, +1)
         float m = float.NegativeInfinity, l = 0;
         for (int b0 = p0; b0 <= p1; b0 += Warp)
@@ -80,7 +86,7 @@ internal static partial class Kernels
                 for (int i = 0; i < p.Hd; i += 32)
                 {
                     // four independent 16-byte loads in flight per step
-                    Half8 ka = k8[k8o + (i >> 3)], kb = k8[k8o + (i >> 3) + 1], kc8 = k8[k8o + (i >> 3) + 2], kd = k8[k8o + (i >> 3) + 3];
+                    Half8 ka = LoadCache8(kc, k8o + (i >> 3), compact), kb = LoadCache8(kc, k8o + (i >> 3) + 1, compact), kc8 = LoadCache8(kc, k8o + (i >> 3) + 2, compact), kd = LoadCache8(kc, k8o + (i >> 3) + 3, compact);
                     acc += Dot8(sh, qs + i, ka) + Dot8(sh, qs + i + 8, kb) + Dot8(sh, qs + i + 16, kc8) + Dot8(sh, qs + i + 24, kd);
                 }
                 s = p.SoftCap > 0 ? Tanh(acc / p.SoftCap) * p.SoftCap : acc;
@@ -108,7 +114,7 @@ internal static partial class Kernels
                 for (int e = 0; e < vPairs; e++)
                 {
                     long o = lane + 32L * e;
-                    Half2 va = v2[r0 + o], vb = v2[r1 + o], vcc = v2[r2 + o], vd = v2[r3 + o];
+                    Half2 va = LoadCache2(vc, r0 + o, compact), vb = LoadCache2(vc, r1 + o, compact), vcc = LoadCache2(vc, r2 + o, compact), vd = LoadCache2(vc, r3 + o, compact);
                     int dd = as_ + 2 * lane + 64 * e;
                     sh[dd] += q0 * (float)va.A + q1 * (float)vb.A + q2 * (float)vcc.A + q3 * (float)vd.A;
                     sh[dd + 1] += q0 * (float)va.B + q1 * (float)vb.B + q2 * (float)vcc.B + q3 * (float)vd.B;

@@ -73,7 +73,7 @@ public sealed unsafe partial class GpuLayerOffload
             _n = m.Layers.Select(L => (F(L.AttnNorm), F(L.QNorm), F(L.AttnPostNorm), F(L.FfnNorm), F(L.FfnPostNorm))).ToArray();
             _outNorm = F(m.OutputNorm);
             _pf = o.Alloc<float>(fp.Count);
-            _pf.View.SubView(0, fp.Count).CopyFromCPU(fp.ToArray());
+            _pf.View.SubView(0, fp.Count).CopyFromCPU(o._stream, fp.ToArray());
             _src = Enumerable.Range(0, m.Layers.Length).Select(il => m.TargetKvLayer(il, o._c)).ToArray();
             foreach (int s in _src)
                 if (o._dl[s].KCache == null) throw new NotSupportedException($"target layer {s} keeps no KV cache on the device");

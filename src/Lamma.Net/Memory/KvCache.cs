@@ -10,7 +10,7 @@ public enum KvCacheType
     F32,
     /// <summary>IEEE half precision (default; same as llama.cpp).</summary>
     F16,
-    /// <summary>8-bit block quantization (Q8_0) — halves memory vs F16 with negligible quality loss.</summary>
+    /// <summary>8-bit block quantization (Q8_0), using 34 bytes per 32 values on compatible heads.</summary>
     Q8_0,
 }
 
@@ -49,7 +49,7 @@ public sealed unsafe class KvCache : IDisposable
         Config = config;
         Type = type;
         PageSize = pageSize;
-        PageCount = Math.Max(1, (maxTokens + pageSize - 1) / pageSize);
+        PageCount = PagesFor(maxTokens, pageSize);
         int n = config.NLayer;
         _k = new NativeBuffer?[n];
         _v = new NativeBuffer?[n];
@@ -71,6 +71,13 @@ public sealed unsafe class KvCache : IDisposable
         }
         _refCount = new int[PageCount];
         for (int p = PageCount - 1; p >= 0; p--) _free.Push(p);
+    }
+
+    internal static int PagesFor(int tokens, int pageSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(tokens);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pageSize);
+        return tokens == 0 ? 1 : 1 + (tokens - 1) / pageSize;
     }
 
     private static long RowBytes(GgmlType t, int headDim) =>

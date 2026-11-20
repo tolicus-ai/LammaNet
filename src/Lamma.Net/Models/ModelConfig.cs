@@ -57,6 +57,7 @@ public sealed class ModelConfig
     public float ResidualScale { get; init; } = 1f;
     /// <summary>Logits are divided by this value (Granite).</summary>
     public float LogitScale { get; init; } = 1f;
+    public float AttentionTemperatureScale { get; init; }
     public float FinalLogitSoftcap { get; init; }
     public float AttnLogitSoftcap { get; init; }
 
@@ -184,6 +185,10 @@ public sealed class ModelConfig
         if (scalingType == "yarn") extFactor = 1f;
         int nCtxOrig = f.Get(P("rope.scaling.original_context_length"), nCtx);
         float attnFactor = f.Get(P("rope.scaling.attn_factor"), 1f);
+        float tempScale = arch == "mistral3" ? f.Get(P("attention.temperature_scale"), 0f) : 0;
+        if (tempScale != 0 && nCtxOrig <= 0) throw new InvalidDataException("Attention temperature scaling requires an original context length");
+        if (arch == "mistral3" && scalingType == "yarn" && factor > 1)
+            attnFactor /= 1 + 0.1f * f.Get(P("rope.scaling.yarn_log_multiplier"), 0f) * MathF.Log(factor);
         int[] sections = f.Has(P("rope.dimension_sections")) ? f.Get<int[]>(P("rope.dimension_sections")) : [0, 0, 0, 0];
         if (sections.Length < 4) sections = [.. sections, .. new int[4 - sections.Length]];
         float[]? freqFactors = ropeFreqFactors;
@@ -202,6 +207,8 @@ public sealed class ModelConfig
                 ExtFactor = extFactor,
                 AttnFactor = attnFactor,
                 NCtxOrig = nCtxOrig,
+                BetaFast = f.Get(P("rope.scaling.yarn_beta_fast"), 32f),
+                BetaSlow = f.Get(P("rope.scaling.yarn_beta_slow"), 1f),
                 Sections = sections,
             };
         }
@@ -249,6 +256,7 @@ public sealed class ModelConfig
             SlidingWindow = swa,
             Activation = gemma ? FfnActivation.GeGlu : FfnActivation.SwiGlu,
             AttentionScale = attnScale,
+            AttentionTemperatureScale = tempScale,
             EmbeddingScale = embScale,
             ResidualScale = f.Get(P("residual_scale"), 1f),
             LogitScale = f.Get(P("logit_scale"), 1f),
@@ -273,7 +281,7 @@ public sealed class ModelConfig
 
     public static RopeMode RopeModeFor(string arch) => arch switch
     {
-        "llama" or "granite" or "granitehybrid" or "granitemoe" or "mistral" or "baichuan" or "deci" or "llama4" => RopeMode.Normal,
+        "llama" or "granite" or "granitehybrid" or "granitemoe" or "mistral" or "mistral3" or "baichuan" or "deci" or "llama4" => RopeMode.Normal,
         "qwen35" or "qwen35moe" or "qwen3vl" or "qwen3vlmoe" => RopeMode.IMRope,
         "qwen2vl" => RopeMode.MRope,
         _ => RopeMode.Neox,

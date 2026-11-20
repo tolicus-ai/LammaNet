@@ -21,6 +21,7 @@ public class ContextShiftTests
     [InlineData(KvCacheType.F16, false)]
     [InlineData(KvCacheType.Q8_0, false)]
     [InlineData(KvCacheType.F16, true)]
+    [InlineData(KvCacheType.Q8_0, true)]
     public void ShiftedKeysMatchFreshPrefill(KvCacheType type, bool gpu)
     {
         var path = TestModels.Find(TestModels.Qwen3Q4);
@@ -36,7 +37,7 @@ public class ContextShiftTests
         // returns layer-0 keys of positions 0.. (after the optional shift)
         List<float[]> Run(IReadOnlyList<int> tokens, bool shift)
         {
-            using var off = gpu ? new GpuLayerOffload(model, new OffloadGeometry(ps, 16, 512), new GpuOffloadOptions { Warmup = false }) : null;
+            using var off = gpu ? new GpuLayerOffload(model, new OffloadGeometry(ps, 16, 512) { KvCacheType = type }, new GpuOffloadOptions { Warmup = false }) : null;
             using var kv = new KvCache(c, 16 * ps, type, ps, off == null ? null : l => !off.OwnsKv(l));
             if (off != null) kv.PageCopied += off.CopyPage;
             using var runner = new ModelRunner(model, kv, pool, 512, 0, off);
@@ -66,13 +67,16 @@ public class ContextShiftTests
         Assert.Equal(expected.Count, shifted.Count);
         double tol = type switch { KvCacheType.F32 => 1e-3, KvCacheType.F16 => 2e-2, _ => 0.15 };
         double maxD = 0, maxAbs = 0;
+        int worstPosition = 0, worstChannel = 0;
         for (int p = 0; p < expected.Count; p++)
             for (int i = 0; i < expected[p].Length; i++)
             {
-                maxD = Math.Max(maxD, Math.Abs(expected[p][i] - shifted[p][i]));
+                double delta = Math.Abs(expected[p][i] - shifted[p][i]);
+                if (delta > maxD) { maxD = delta; worstPosition = p; worstChannel = i; }
                 maxAbs = Math.Max(maxAbs, Math.Abs(expected[p][i]));
             }
-        Assert.True(maxD <= tol * Math.Max(1, maxAbs / 10), $"{type} gpu={gpu}: max |dK| {maxD} (max |K| {maxAbs})");
+        Assert.True(maxD <= tol * Math.Max(1, maxAbs / 10),
+            $"{type} gpu={gpu}: max |dK| {maxD} at position {worstPosition}, channel {worstChannel} (max |K| {maxAbs}).");
     }
 
     /// <summary>With ContextShift the engine keeps generating past ContextSize (CPU and, when present, GPU).</summary>

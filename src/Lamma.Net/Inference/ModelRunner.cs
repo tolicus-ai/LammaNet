@@ -22,7 +22,9 @@ public sealed unsafe class ModelRunner : IDisposable
 
     // scratch buffers (sized for _maxBatch rows)
     private readonly NativeBuffer _x, _xb, _xb2, _q, _k, _v, _att, _gate, _up, _tmp;
-    private readonly NativeBuffer _logits;
+    private NativeBuffer? _logits;
+    private IDisposable? _logitsPin;
+    private int _logitRows;
     private readonly NativeBuffer? _ple, _pleTmp;
     private readonly NativeBuffer? _embOut; // embedding models: per-token output projection (NEmbdOut wide)
     private readonly NativeBuffer _ropeCache;
@@ -86,7 +88,6 @@ public sealed unsafe class ModelRunner : IDisposable
         _gate = new NativeBuffer((long)n * maxFf * 4);
         _up = new NativeBuffer((long)n * maxFf * 4);
         _tmp = new NativeBuffer((long)n * Math.Max(maxQ, maxFf) * 4);
-        _logits = new NativeBuffer((long)_maxLogits * c.NVocab * 4, zero: false, pageAligned: pin);
         if (c.NEmbdPerLayer > 0)
         {
             _ple = new NativeBuffer((long)n * c.NLayer * c.NEmbdPerLayer * 4, pageAligned: pin);
@@ -96,19 +97,44 @@ public sealed unsafe class ModelRunner : IDisposable
         int maxRot = c.Rope.Where(r => r != null).Select(r => r!.Dims).DefaultIfEmpty(2).Max();
         _ropeCache = new NativeBuffer((long)n * 2 * maxRot * 4, pageAligned: pin);
         if (_offload != null)
-            foreach (var b in new[] { _x, _logits, _ple, _ropeCache })
+            foreach (var b in new[] { _x, _ple, _ropeCache })
             {
                 if (b == null) continue;
-                // logits: only the first rows (decode, small batches) — page-locking a whole 512-row x 262k-vocab buffer
-                // would lock half a gigabyte of RAM; later rows are still copied, just staged by the driver
-                long bytes = b == _logits ? Math.Min(b.Capacity, ((long)64 * c.NVocab * 4 + NativeBuffer.PageSize - 1) / NativeBuffer.PageSize * NativeBuffer.PageSize) : b.Capacity;
-                if (_offload.PinHostMemory(b.Pointer, bytes) is { } handle) _pinned.Add(handle);
+                if (_offload.PinHostMemory(b.Pointer, b.Capacity) is { } handle) _pinned.Add(handle);
             }
     }
 
-    /// <summary>Logits of the i-th output row of the last forward pass.</summary>
-    public Span<float> Logits(int i) => new(_logits.F + (long)i * _c.NVocab, _c.NVocab);
-    public float* LogitsPtr(int i) => _logits.F + (long)i * _c.NVocab;
+    /// <summary>Logits of the i-th output row, valid until the next forward pass or disposal.</summary>
+    public Span<float> Logits(int i) => new(LogitsPtr(i), _c.NVocab);
+    /// <summary>Pointer to the same row as <see cref="Logits"/>, with the same lifetime.</summary>
+    public float* LogitsPtr(int i)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(i);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(i, _logitRows);
+        return _logits!.F + (long)i * _c.NVocab;
+    }
+
+    // Most prompt batches need at most one vocabulary row. Keep the high-water mark for reuse.
+    private void ReserveLogits(int rows)
+    {
+        long bytes = (long)rows * _c.NVocab * sizeof(float);
+        if (bytes <= (_logits?.Length ?? 0)) return;
+        var buffer = new NativeBuffer(bytes, zero: false, pageAligned: _offload != null);
+        IDisposable? pin = null;
+        try
+        {
+            if (_offload?.ComputesHead == true)
+            {
+                long pinLimit = (64L * _c.NVocab * sizeof(float) + NativeBuffer.PageSize - 1) / NativeBuffer.PageSize * NativeBuffer.PageSize;
+                pin = _offload.PinHostMemory(buffer.Pointer, Math.Min(buffer.Capacity, pinLimit));
+            }
+        }
+        catch { buffer.Dispose(); throw; }
+        _logitsPin?.Dispose();
+        _logits?.Dispose();
+        _logits = buffer;
+        _logitsPin = pin;
+    }
 
     /// <summary>
     /// Embedding of output row i after an embeddings-only forward: the final-norm hidden state, or for embedding models
@@ -134,10 +160,12 @@ public sealed unsafe class ModelRunner : IDisposable
     {
         using var _prof = Profiler.Section("forward");
         int n = batch.Count;
+        _logitRows = 0;
         if (n == 0) return;
         if (n > _maxBatch) throw new ArgumentException($"Batch of {n} exceeds max batch {_maxBatch}");
         if (batch.LogitCount > _maxLogits) throw new ArgumentException("Too many logit rows requested");
         if (_c.IsEmbeddingModel && !embeddingsOnly && batch.LogitCount > 0) throw new InvalidOperationException("Embedding models produce embeddings, not logits");
+        if (!embeddingsOnly) ReserveLogits(batch.LogitCount);
         var c = _c;
         int d = c.NEmbd;
         float eps = c.RmsEps;
@@ -191,7 +219,7 @@ public sealed unsafe class ModelRunner : IDisposable
                 {
                     X = x, N = n, Sequences = seqs, Positions = pos,
                     PerLayerInputs = _ple != null ? _ple.F : null, RopeCaches = ropeCaches,
-                    OutputRows = headOnDevice ? outRows.ToArray() : null, Logits = headOnDevice ? _logits.F : null,
+                    OutputRows = headOnDevice ? outRows.ToArray() : null, Logits = headOnDevice ? _logits!.F : null,
                 });
             firstHostLayer = _offload.LayerCount;
         }
@@ -200,7 +228,7 @@ public sealed unsafe class ModelRunner : IDisposable
             var L = _model.Layers[il];
             float* xb = _xb.F;
             // attn norm
-            RowsRmsNorm(x, L.AttnNorm, xb, rows, d, eps);
+            RowsInputNorm(x, L.AttnNorm, L.AttnNormBias, xb, rows, d, eps);
 
             float* mixOut = _att.F; // result of mixer projected back to d
             using (Profiler.Section("mixer"))
@@ -222,6 +250,7 @@ public sealed unsafe class ModelRunner : IDisposable
                     if (src == i) continue;
                     Ops.Copy(x + (long)src * d, x + (long)i * d, d);
                     Ops.Copy(mixOut + (long)src * d, mixOut + (long)i * d, d);
+                    if (c.Traits.Phi2) Ops.Copy(xb + (long)src * d, xb + (long)i * d, d);
                     if (_ple != null)
                         Ops.Copy(_ple.F + (long)src * c.NLayer * c.NEmbdPerLayer, _ple.F + (long)i * c.NLayer * c.NEmbdPerLayer, c.NLayer * c.NEmbdPerLayer);
                 }
@@ -236,7 +265,7 @@ public sealed unsafe class ModelRunner : IDisposable
             // ---- FFN
             if (L.FfnDown != null)
             {
-                RowsRmsNorm(x, L.FfnNorm, xb, rows, d, eps);
+                if (!c.Traits.Phi2) RowsRmsNorm(x, L.FfnNorm, xb, rows, d, eps);
                 float* ffo = _att.F;
                 using (Profiler.Section("ffn")) Ffn(L, xb, ffo, rows);
                 if (L.FfnPostNorm != null) RowsRmsNorm(ffo, L.FfnPostNorm, ffo, rows, d, eps);
@@ -272,23 +301,26 @@ public sealed unsafe class ModelRunner : IDisposable
             else if (pos[t] > sq.Length) throw new InvalidOperationException("Batch positions must be contiguous per sequence");
         }
 
+        if (headOnDevice) _logitRows = rows;
         if (rows == 0 || outRows.Count == 0 || headOnDevice) return;
 
         // ---------------- head
         float* h = _xb.F;
-        RowsRmsNorm(x, _model.OutputNorm, h, rows, d, eps);
+        RowsInputNorm(x, _model.OutputNorm, _model.OutputNormBias, h, rows, d, eps);
         if (embeddingsOnly)
         {
             if (_embOut != null) _mm.Multiply(_model.Output, h, rows, _embOut.F, d, c.NEmbdOut);
             return;
         }
-        float* logits = _logits.F;
+        float* logits = _logits!.F;
         if (Environment.GetEnvironmentVariable("LAMMA_X2") == "1") using (Profiler.Section("lm_head_pre")) _mm.Multiply(_model.Output, h, rows, logits, d, c.NVocab);
         using (Profiler.Section("lm_head")) _mm.Multiply(_model.Output, h, rows, logits, d, c.NVocab);
+        AddBias(logits, _model.OutputBias, rows, c.NVocab, c.NVocab);
         long total = (long)rows * c.NVocab;
         if (c.LogitScale != 1f) Ops.Scale(logits, 1f / c.LogitScale, logits, (int)total);
         if (c.FinalLogitSoftcap > 0)
             for (int r = 0; r < rows; r++) Ops.SoftCap(logits + (long)r * c.NVocab, logits + (long)r * c.NVocab, c.NVocab, c.FinalLogitSoftcap);
+        _logitRows = rows;
     }
 
     // ===================================================================== helpers
@@ -305,6 +337,13 @@ public sealed unsafe class ModelRunner : IDisposable
             float* p = x + (long)r * d;
             Console.Error.WriteLine($"   [{p[0],10:F4}, {p[1],10:F4}, {p[2],10:F4}, ..., {p[d - 3],10:F4}, {p[d - 2],10:F4}, {p[d - 1],10:F4}]");
         }
+    }
+
+    private void RowsInputNorm(float* x, float[]? weights, float[]? bias, float* y, int rows, int d, float eps)
+    {
+        if (bias == null) { RowsRmsNorm(x, weights, y, rows, d, eps); return; }
+        fixed (float* w = weights, b = bias)
+            for (int r = 0; r < rows; r++) Ops.LayerNorm(x + (long)r * d, w, b, y + (long)r * d, d, eps);
     }
 
     private void RowsRmsNorm(float* x, float[]? w, float* y, int rows, int d, float eps)
@@ -370,6 +409,7 @@ public sealed unsafe class ModelRunner : IDisposable
             int total = L.Wqkv.Rows;
             float* qkv = _tmp.F;
             _mm.Multiply(L.Wqkv, xb, n, qkv, c.NEmbd, total);
+            AddBias(qkv, L.Bqkv, n, total, total);
             for (int t = 0; t < n; t++)
             {
                 float* r = qkv + (long)t * total;
@@ -422,6 +462,8 @@ public sealed unsafe class ModelRunner : IDisposable
             float* qt = q + (long)t * qDim;
             if (qn != null) fixed (float* w = qn) for (int h = 0; h < nh; h++) Ops.RmsNorm(qt + h * hk, w, qt + h * hk, hk, eps);
             if (rope != null) rope.Apply(qt, nh, hk, rc + (long)t * rope.Dims);
+            if (c.AttentionTemperatureScale != 0 && pos[t] >= rope!.NCtxOrig)
+                Ops.Scale(qt, 1 + c.AttentionTemperatureScale * MathF.Log(1 + pos[t] / rope.NCtxOrig), qt, nh * hk);
             if (ownKv)
             {
                 float* kt = k + (long)t * kDim, vt = v + (long)t * vDim;
@@ -503,6 +545,7 @@ public sealed unsafe class ModelRunner : IDisposable
             };
             _pool.Run(_rowJob, tasks);
         }
+        else if (c.Traits.Phi2) Ops.Gelu(u, u, checked(rows * ff));
         _mm.Multiply(L.FfnDown, u, rows, outp, ff, c.NEmbd);
         AddBias(outp, L.FfnDownBias, rows, c.NEmbd, c.NEmbd);
     }
@@ -854,7 +897,10 @@ public sealed unsafe class ModelRunner : IDisposable
         foreach (var p in _pinned) p.Dispose();   // unregister before the memory is freed
         _pinned.Clear();
         _x.Dispose(); _xb.Dispose(); _xb2.Dispose(); _q.Dispose(); _k.Dispose(); _v.Dispose(); _att.Dispose();
-        _gate.Dispose(); _up.Dispose(); _tmp.Dispose(); _logits.Dispose(); _ple?.Dispose(); _pleTmp?.Dispose(); _embOut?.Dispose();
+        _logitRows = 0;
+        _logitsPin?.Dispose();
+        _logitsPin = null;
+        _gate.Dispose(); _up.Dispose(); _tmp.Dispose(); _logits?.Dispose(); _ple?.Dispose(); _pleTmp?.Dispose(); _embOut?.Dispose();
         _ropeCache.Dispose(); _attn.Dispose();
     }
 }

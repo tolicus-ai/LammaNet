@@ -10,6 +10,7 @@ public sealed class LayerWeights
 
     // ---- normalization
     public float[]? AttnNorm;
+    public float[]? AttnNormBias;
     /// <summary>Applied to the mixer output before the residual add (Gemma "post_attention_norm").</summary>
     public float[]? AttnPostNorm;
     /// <summary>Pre-FFN norm.</summary>
@@ -19,7 +20,7 @@ public sealed class LayerWeights
 
     // ---- attention
     public WeightTensor? Wq, Wk, Wv, Wqkv, Wo;
-    public float[]? Bq, Bk, Bv, Bo;
+    public float[]? Bq, Bk, Bv, Bqkv, Bo;
     public float[]? QNorm, KNorm;
 
     // ---- FFN

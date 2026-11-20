@@ -26,6 +26,8 @@ public sealed unsafe class Model : IDisposable
     public WeightTensor TokenEmbedding { get; }
     public WeightTensor Output { get; }
     public float[] OutputNorm { get; }
+    public float[]? OutputNormBias { get; private init; }
+    public float[]? OutputBias { get; private init; }
     public LayerWeights[] Layers { get; }
 
     // Gemma 3n/4 per-layer embeddings
@@ -82,6 +84,11 @@ public sealed unsafe class Model : IDisposable
                 string p = $"blk.{i}.";
                 var lw = new LayerWeights { Index = i, Kind = cfg.Kinds[i] };
                 lw.AttnNorm = FOpt(p + "attn_norm.weight");
+                if (cfg.Traits.Phi2)
+                {
+                    lw.AttnNormBias = T(p + "attn_norm.bias").ToFloatArray();
+                    lw.Bqkv = FOpt(p + "attn_qkv.bias");
+                }
                 if (qwen35) lw.FfnNorm = FOpt(p + "post_attention_norm.weight");
                 else
                 {
@@ -153,7 +160,11 @@ public sealed unsafe class Model : IDisposable
             var pleProj = f.TryGetTensor("per_layer_model_proj.weight", out var pj) ? WeightTensor.FromGguf(f, pj) : null;
             var pleNorm = f.TryGetTensor("per_layer_proj_norm.weight", out var pn) ? WeightTensor.FromGguf(f, pn).ToFloatArray() : null;
 
-            var model = new Model(f, cfg, vocab, tok, output, outNorm, layers, pleTok, pleProj, pleNorm);
+            var model = new Model(f, cfg, vocab, tok, output, outNorm, layers, pleTok, pleProj, pleNorm)
+            {
+                OutputNormBias = cfg.Traits.Phi2 ? T("output_norm.bias").ToFloatArray() : null,
+                OutputBias = cfg.Traits.Phi2 ? T("output.bias").ToFloatArray() : null,
+            };
             if (options.Prefetch) model.Prefetch();
             Log.ModelLoaded(log, path, cfg.Name, cfg.Architecture, cfg.NLayer, f.FileSize >> 20,
                 System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds);

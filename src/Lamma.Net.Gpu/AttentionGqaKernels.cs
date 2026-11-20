@@ -25,7 +25,15 @@ internal static partial class Kernels
     /// Hd ≤ MaxHeadDim. Grid: N × NKv × NChunks groups of 128.
     /// </summary>
     public static void AttnDecodeGqa(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
-        ArrayView<float> outp, ArrayView<float> part, AttnParams p, SpecializedValue<int> groupSpec, SpecializedValue<int> hdSpec)
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p, SpecializedValue<int> groupSpec, SpecializedValue<int> hdSpec) =>
+        AttnDecodeGqaCore(q, kc, vc, pages, tokInfo, outp, part, p, groupSpec, hdSpec, 0);
+
+    internal static void AttnDecodeGqaQ8(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p, SpecializedValue<int> groupSpec, SpecializedValue<int> hdSpec) =>
+        AttnDecodeGqaCore(q, kc, vc, pages, tokInfo, outp, part, p, groupSpec, hdSpec, 1);
+
+    private static void AttnDecodeGqaCore(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<float> outp, ArrayView<float> part, AttnParams p, SpecializedValue<int> groupSpec, SpecializedValue<int> hdSpec, int compact)
     {
         int G = groupSpec.Value;
         var qs = SharedMemory.Allocate<float>(groupSpec.Value * hdSpec.Value);         // scaled q rows of the group
@@ -39,8 +47,6 @@ internal static partial class Kernels
         var q4 = qs.Cast<Float4>();
         var ps4 = ps.Cast<Float4>();
         var pr4 = pr.Cast<Float4>();
-        var k8 = kc.Cast<Half8>();
-        var v2 = vc.Cast<Half2>();
         var qg4 = q.Cast<Float4>();
         int tid = Group.IdxX, warp = tid / Warp, lane = tid & (Warp - 1);
         int blk = Grid.IdxX;
@@ -92,13 +98,13 @@ internal static partial class Kernels
                 int d8 = 0;
                 for (; d8 + 4 <= n8; d8 += 4)
                 {
-                    Half8 ka = k8[k8o + d8], kb = k8[k8o + d8 + 1], kcc = k8[k8o + d8 + 2], kd = k8[k8o + d8 + 3];
+                    Half8 ka = LoadCache8(kc, k8o + d8, compact), kb = LoadCache8(kc, k8o + d8 + 1, compact), kcc = LoadCache8(kc, k8o + d8 + 2, compact), kd = LoadCache8(kc, k8o + d8 + 3, compact);
                     s.Add(ka, q4, qi + 2 * d8, hs, G);
                     s.Add(kb, q4, qi + 2 * d8 + 2, hs, G);
                     s.Add(kcc, q4, qi + 2 * d8 + 4, hs, G);
                     s.Add(kd, q4, qi + 2 * d8 + 6, hs, G);
                 }
-                for (; d8 < n8; d8++) s.Add(k8[k8o + d8], q4, qi + 2 * d8, hs, G);
+                for (; d8 < n8; d8++) s.Add(LoadCache8(kc, k8o + d8, compact), q4, qi + 2 * d8, hs, G);
             }
             int po = (warp * GqaPass + lane) * 2;
             ps4[po] = new Float4 { X = s.S0, Y = s.S1, Z = s.S2, W = s.S3 };
@@ -140,8 +146,8 @@ internal static partial class Kernels
                 int j = 0;
                 for (; j + 8 <= cnt; j += 8)
                 {
-                    Half2 v0 = v2[rows[j] + vo], v1 = v2[rows[j + 1] + vo], v2_ = v2[rows[j + 2] + vo], v3 = v2[rows[j + 3] + vo];
-                    Half2 v4 = v2[rows[j + 4] + vo], v5 = v2[rows[j + 5] + vo], v6 = v2[rows[j + 6] + vo], v7 = v2[rows[j + 7] + vo];
+                    Half2 v0 = LoadCache2(vc, rows[j] + vo, compact), v1 = LoadCache2(vc, rows[j + 1] + vo, compact), v2_ = LoadCache2(vc, rows[j + 2] + vo, compact), v3 = LoadCache2(vc, rows[j + 3] + vo, compact);
+                    Half2 v4 = LoadCache2(vc, rows[j + 4] + vo, compact), v5 = LoadCache2(vc, rows[j + 5] + vo, compact), v6 = LoadCache2(vc, rows[j + 6] + vo, compact), v7 = LoadCache2(vc, rows[j + 7] + vo, compact);
                     o.Add(pr4[2 * j], pr4[2 * j + 1], v0, G);
                     o.Add(pr4[2 * j + 2], pr4[2 * j + 3], v1, G);
                     o.Add(pr4[2 * j + 4], pr4[2 * j + 5], v2_, G);
@@ -151,7 +157,7 @@ internal static partial class Kernels
                     o.Add(pr4[2 * j + 12], pr4[2 * j + 13], v6, G);
                     o.Add(pr4[2 * j + 14], pr4[2 * j + 15], v7, G);
                 }
-                for (; j < cnt; j++) o.Add(pr4[2 * j], pr4[2 * j + 1], v2[rows[j] + vo], G);
+                for (; j < cnt; j++) o.Add(pr4[2 * j], pr4[2 * j + 1], LoadCache2(vc, rows[j] + vo, compact), G);
                 o.Store(acc, d0, hdv, G);
             }
         }

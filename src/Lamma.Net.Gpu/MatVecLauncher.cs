@@ -25,6 +25,7 @@ internal sealed class MatVecLauncher
     private MemoryBuffer1D<uint, Stride1D.Dense>? _xq;
     private MemoryBuffer1D<Float2, Stride1D.Dense>? _xd;
     private long _q8Rows, _q8Cols;
+    internal long ScratchBytes => (_xq?.LengthInBytes ?? 0) + (_xd?.LengthInBytes ?? 0);
 
     /// <summary>
     /// Which calls use int8 activations with dp4a (only after <see cref="Reserve"/>). Measured on an RTX 3070: 4 tokens

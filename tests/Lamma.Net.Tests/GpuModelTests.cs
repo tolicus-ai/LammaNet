@@ -1,6 +1,9 @@
 using ILGPU;
 using ILGPU.Runtime;
+using LammaNet.Compute;
 using LammaNet.Gpu;
+using LammaNet.Inference;
+using LammaNet.Memory;
 using LammaNet.Models;
 
 namespace LammaNet.Tests;
@@ -13,6 +16,51 @@ namespace LammaNet.Tests;
 public class GpuModelTests
 {
     private static readonly bool HasCuda = HasCudaDevice();
+
+    [Fact]
+    public void Gemma3Q40DefaultPrefillTracksFloatReference()
+    {
+        var path = TestModels.Find("gemma-3-4b-it-q4_0.gguf");
+        if (path == null || !HasCuda || Environment.GetEnvironmentVariable("LAMMA_GPU_Q8") != null) return;
+        using var model = Model.Load(path);
+        var result = GpuValidation.Compare(model, new GpuOffloadOptions(), nGen: 8);
+        Assert.False(result.Int8);
+        if (result.OffloadedLayers == model.Config.NLayer)
+            Assert.True(result.Passed, $"decode {result.GpuDecode}, prefill {result.GpuPrefill}");
+    }
+
+    [Theory]
+    [InlineData(KvCacheType.F16)]
+    [InlineData(KvCacheType.Q8_0)]
+    public void SmallGpuCacheSupportsWarmupAndGrowingLogitOutput(KvCacheType type)
+    {
+        var path = TestModels.Find(TestModels.Qwen3Q4);
+        if (path == null || !HasCuda) return;
+        using var model = Model.Load(path);
+        using var off = new GpuLayerOffload(model, new OffloadGeometry(4, 2, 3) { KvCacheType = type },
+            new GpuOffloadOptions { Device = GpuDevice.Cuda });
+        Assert.True(off.ComputesHead);
+        using var pool = new ComputePool(2);
+        using var kv = new KvCache(model.Config, 8, type, pageSize: 4, hostLayer: l => !off.OwnsKv(l));
+        using var runner = new ModelRunner(model, kv, pool, maxBatch: 3, offload: off);
+        using var seq = new SequenceState(kv, model.Config);
+        var batch = new Batch();
+        batch.Add(seq, 100, 0, true);
+        runner.Forward(batch);
+        batch.Clear();
+        batch.Add(seq, 101, 1, true);
+        batch.Add(seq, 102, 2, true);
+        runner.Forward(batch);
+        Assert.True(float.IsFinite(runner.Logits(1)[100]));
+        int page = seq.PageTable[0], copy = 1 - page;
+        off.CopyPage(page, copy, 3);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(off.ReadKeyRow(0, page * 4 + i), off.ReadKeyRow(0, copy * 4 + i));
+        batch.Clear();
+        batch.Add(seq, 103, 3, false);
+        runner.Forward(batch);
+        Assert.Throws<ArgumentOutOfRangeException>(() => runner.Logits(0)[0]);
+    }
 
     private static bool HasCudaDevice()
     {

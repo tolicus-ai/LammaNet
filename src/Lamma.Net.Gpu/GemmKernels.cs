@@ -119,6 +119,7 @@ internal sealed class GemmLauncher : IDisposable
     private readonly Dictionary<int, Action<AcceleratorStream, KernelConfig, ArrayView<uint>, ArrayView<float>, ArrayView<uint>, ArrayView<Float2>, ArrayView<float>, GemmParams>> _kernelsQ8 = new();
     private MemoryBuffer1D<uint, Stride1D.Dense>? _gq;
     private MemoryBuffer1D<Float2, Stride1D.Dense>? _gd;
+    internal long ScratchBytes => (_xh?.LengthInBytes ?? 0) + (_gq?.LengthInBytes ?? 0) + (_gd?.LengthInBytes ?? 0);
 
     /// <summary>
     /// int8 tensor-core GEMMs (<see cref="Kernels.TcGemmQ4K"/>, <see cref="Kernels.TcGemmQ40"/>, <see cref="Kernels.TcGemmQ80"/>)

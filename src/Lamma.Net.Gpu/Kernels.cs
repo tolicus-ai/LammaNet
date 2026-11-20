@@ -35,7 +35,7 @@ public struct QkvParams
 {
     public long QOff, KOff, VOff, QNormOff, KNormOff, RopeOff;
     public int N, NHead, NKv, Hd, HdV, QStride, KStride, VStride, QHeadPitch;
-    public int KRow, VRow, OwnKv, VNorm, RopeDims, RopeNeox, RopeStride;
+    public int KRow, VRow, OwnKv, VNorm, RopeDims, RopeNeox, RopeStride, DenseKvRows;
     /// <summary>
     /// Neox rotation in segments of this many pairs (0 = one segment of RopeDims/2 pairs): segment s rotates
     /// (s·2P + j, s·2P + j + P). Gemma 4 vision rotates each half of the head separately (P = hd/4).
@@ -113,6 +113,12 @@ internal static partial class Kernels
     // ------------------------------------------------------------------ element-wise
 
     public static void Scale(Index1D i, ArrayView<float> a, float s) => a[i] = a[i] * s;
+
+    public static void ScaleQueryTemperature(Index1D i, ArrayView<float> q, ArrayView<int> info, int width, int stride, int originalContext, float scale)
+    {
+        int t = i / width, bucket = info[3 * t + 2] / originalContext;
+        if (bucket > 0) q[(long)t * stride + i % width] *= 1f + scale * MathF.Log(1 + bucket);
+    }
 
     /// <summary>Copies rows: dst[r * dstStride + c] = src[srcRows[r] * srcStride + c] (gathers output rows for the head).</summary>
     public static void GatherRows(Index1D i, ArrayView<float> src, ArrayView<float> dst, ArrayView<int> srcRows, int cols)
@@ -278,7 +284,7 @@ internal static partial class Kernels
             ss = WarpSum(ss);
             scale = 1f / MathF.Sqrt(ss / hd + p.Eps);
         }
-        long slot = kind == 0 ? 0 : slots[t];
+        long slot = kind == 0 ? 0 : p.DenseKvRows != 0 ? t : slots[t];
         long dstK = slot * p.KRow + (long)h * p.Hd, dstV = slot * p.VRow + (long)h * p.HdV;
         int rotDims = kind == 2 ? 0 : p.RopeDims, half = rotDims / 2;
         int seg = p.RopeSegPairs > 0 ? p.RopeSegPairs : half;

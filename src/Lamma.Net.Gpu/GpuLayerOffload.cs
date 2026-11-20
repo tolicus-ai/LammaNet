@@ -35,6 +35,8 @@ public enum Int8Activations
     Normalized,
     /// <summary>Every supported projection, as llama.cpp does: fastest, with measurably noisier probabilities on Gemma 4.</summary>
     All,
+    /// <summary>Use normalized int8 projections by default and float activations for Gemma 3 with Q4_0 projections.</summary>
+    Auto,
 }
 
 /// <summary>Options for GPU offloading.</summary>
@@ -58,7 +60,7 @@ public sealed class GpuOffloadOptions
     /// 8-bit integer activations for quantized weights (Q4_0, Q8_0, Q4_K, Q6_K): decode +2-18% (Gemma 4 the most) and batches of 2-8 tokens
     /// (speculative verification, concurrent requests) 2-6x faster per matrix. LAMMA_GPU_Q8 (0, normalized, all) overrides.
     /// </summary>
-    public Int8Activations Int8 { get; init; } = Int8Activations.Normalized;
+    public Int8Activations Int8 { get; init; } = Int8Activations.Auto;
     /// <summary>
     /// Compile the specialized kernels and capture the decode graph while loading (a scratch prompt and decode step),
     /// so the first request does not pay for it.
@@ -67,7 +69,7 @@ public sealed class GpuOffloadOptions
 }
 
 /// <summary>
-/// Runs the first N decoder layers of a model on a GPU through ILGPU, with their KV cache (fp16) in device memory.
+/// Runs the first N decoder layers of a model on a GPU through ILGPU, with their FP16 or Q8_0 KV cache in device memory.
 /// Attention layers of the Llama / Qwen2-3.5 / Granite / Gemma 2-4 families and the recurrent layers of hybrid models
 /// (Gated DeltaNet of Qwen3.5, Mamba2 of Granite 4-H) are supported; recurrent states of live sequences stay in device
 /// slots (<see cref="IRecurrentStateStore"/>), snapshots for prefix reuse are host copies.
@@ -89,6 +91,11 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     private readonly int _maxBatch;
     private readonly int _pageSize;
     private readonly int _pageCount;
+    private readonly bool _kvQ8;
+    private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, ArrayView<int>, int, int, int, float>? _scaleQueryTemperature;
+    private readonly MemoryBuffer1D<Half, Stride1D.Dense>? _keyRows, _valueRows;
+    private readonly Action<AcceleratorStream, KernelConfig, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, int, int>? _packKv;
+    private readonly Action<AcceleratorStream, KernelConfig, ArrayView<Half>, ArrayView<int>, ArrayView<float>, int, int, int, int, int>? _rotateQ8;
     private readonly DLayer[] _dl;
     private readonly List<MemoryBuffer> _owned = new();
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _f; // all small float parameters (norm weights, biases)
@@ -276,6 +283,7 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     /// <summary>Number of leading layers of <paramref name="config"/> that this backend can execute.</summary>
     public static int SupportedLayerPrefix(ModelConfig config)
     {
+        if (config.Traits.Phi2) return 0; // affine layer norm and parallel, biased MLP run on the host
         int n = 0;
         while (n < config.NLayer && LayerSupported(config, n)) n++;
         return n;
@@ -303,6 +311,7 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                 _maxBatch = geometry.MaxBatch;
                 _pageSize = geometry.PageSize;
                 _pageCount = geometry.PageCount;
+                _kvQ8 = geometry.KvCacheType == KvCacheType.Q8_0;
                 _ctx = Context.Create(b => { b.Default().Math(MathMode.Fast32BitOnly).EnableAlgorithms(); if (s_profile) b.Profiling(); });
                 Device dev = options.Device switch
                 {
@@ -323,23 +332,28 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                     Int8 = Environment.GetEnvironmentVariable("LAMMA_GPU_Q8") switch
                     {
                         "0" or "off" => Int8Activations.Off, "1" or "normalized" => Int8Activations.Normalized, "all" => Int8Activations.All,
-                        _ => options.Int8,
+                        _ when options.Int8 != Int8Activations.Auto => options.Int8,
+                        // Gemma 3 Q4_0 accumulates appreciable logit error from int8 projection inputs.
+                        _ when _c.Architecture == "gemma3" && model.Layers[0].Wq?.Type == GgmlType.Q4_0 => Int8Activations.Off,
+                        _ => Int8Activations.Normalized,
                     },
                 };
                 _gemm = new GemmLauncher(_acc);
                 if (_gemm.TensorCores)
-                    _kTcPrefill = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<float>, AttnParams, SpecializedValue<int>>(Kernels.TcAttnPrefill);
+                    _kTcPrefill = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<float>, AttnParams, SpecializedValue<int>>(_kvQ8 ? Kernels.TcAttnPrefillQ8 : Kernels.TcAttnPrefill);
                 _kActMul = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<float>, ArrayView<float>, int>(Kernels.ActMul);
                 _kRms = _acc.LoadKernel<ArrayView<float>, ArrayView<float>, ArrayView<float>, NormParams>(Kernels.RmsNorm);
                 _kResNorm = _acc.LoadKernel<ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>, ResidualNormParams>(Kernels.RmsNormResidualNorm);
                 _kQkv = _acc.LoadKernel<ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, QkvParams>(Kernels.QkvPost);
-                _kAttn = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams>(Kernels.AttnDecode);
-                _kAttnGqa = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams, SpecializedValue<int>, SpecializedValue<int>>(Kernels.AttnDecodeGqa);
+                _kAttn = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams>(_kvQ8 ? Kernels.AttnKvQ8 : Kernels.AttnDecode);
+                _kAttnGqa = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams, SpecializedValue<int>, SpecializedValue<int>>(_kvQ8 ? Kernels.AttnDecodeGqaQ8 : Kernels.AttnDecodeGqa);
                 _gqaDecode = s_gqaAttn && Enumerable.Range(0, _layers).Where(l => _c.Kinds[l] == LayerKind.Attention).All(GqaFits);
                 _minChunk = s_minChunk ?? (_gqaDecode ? Kernels.GqaPass : 32);
                 _kCombine = _acc.LoadKernel<ArrayView<float>, ArrayView<float>, ArrayView<float>, AttnParams>(Kernels.AttnCombine2);
                 _kPrefill = _acc.LoadKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<float>, AttnParams, SpecializedValue<int>>(Kernels.AttnPrefill);
                 _kScale = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<float>, float>(Kernels.Scale);
+                if (_c.AttentionTemperatureScale != 0)
+                    _scaleQueryTemperature = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<float>, ArrayView<int>, int, int, int, float>(Kernels.ScaleQueryTemperature);
                 _kGather = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int>(Kernels.GatherRows);
                 _kGeluMul = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<float>, ArrayView<float>, int, int, int>(Kernels.GeluMul);
                 _kPageCopy = _acc.LoadAutoGroupedKernel<Index1D, ArrayView<Half>, long, long>(Kernels.PageCopy);
@@ -388,8 +402,8 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                     else if (_c.KvSourceLayer[il] == il)
                     {
                         long rowsTotal = (long)_pageCount * _pageSize;
-                        d.KCache = Alloc<Half>(rowsTotal * _c.NHeadKv[il] * _c.HeadDimK[il]);
-                        d.VCache = Alloc<Half>(rowsTotal * _c.NHeadKv[il] * _c.HeadDimV[il]);
+                        d.KCache = Alloc<Half>(CacheWords(rowsTotal * _c.NHeadKv[il] * _c.HeadDimK[il], _kvQ8));
+                        d.VCache = Alloc<Half>(CacheWords(rowsTotal * _c.NHeadKv[il] * _c.HeadDimV[il], _kvQ8));
                     }
                     _dl[il] = d;
                     int qMul = _c.GatedAttention ? 2 : 1;
@@ -426,6 +440,13 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                 _x = Alloc<float>(nb * _c.NEmbd); _xb = Alloc<float>(nb * _c.NEmbd); _mix = Alloc<float>(nb * _c.NEmbd);
                 _kBase = nb * maxQ; _vBase = _kBase + nb * maxKv;
                 _qkv = Alloc<float>(_vBase + nb * maxKv);
+                if (_kvQ8 && maxKv > 0)
+                {
+                    _keyRows = Alloc<Half>((long)_maxBatch * maxKv);
+                    _valueRows = Alloc<Half>((long)_maxBatch * maxKv);
+                    _packKv = _acc.LoadKernel<ArrayView<Half>, ArrayView<Half>, ArrayView<int>, int, int>(Kernels.PackKvQ8);
+                    _rotateQ8 = _acc.LoadKernel<ArrayView<Half>, ArrayView<int>, ArrayView<float>, int, int, int, int, int>(Kernels.RotateKvQ8);
+                }
                 _att = Alloc<float>(nb * Math.Max(maxAtt, _c.NEmbd));
                 _ff = Alloc<float>(nb * maxFf);
                 _ff2 = Alloc<float>(nb > Kernels.MatVecTokens ? nb * maxFf : 4);
@@ -487,10 +508,12 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     /// </summary>
     private void Warm(Model model)
     {
-        int n = Math.Min(Math.Max(16, s_gemmMinTokens), _maxBatch), d = _c.NEmbd;
-        using var kv = new KvCache(_c, n + 9 + _pageSize, KvCacheType.F16, _pageSize, _ => false, _hasRec ? this : null);
+        int capacity = (int)Math.Min(int.MaxValue, (long)_pageCount * _pageSize);
+        int n = Math.Min(Math.Min(Math.Max(16, s_gemmMinTokens), _maxBatch), capacity), d = _c.NEmbd;
+        int warmTokens = (int)Math.Min((long)n + 9, capacity);
+        using var kv = new KvCache(_c, warmTokens, KvCacheType.F16, _pageSize, _ => false, _hasRec ? this : null);
         using var seq = new SequenceState(kv, _c);
-        if (!seq.EnsureCapacity(n + 9)) return;
+        if (!seq.EnsureCapacity(warmTokens)) return;
         var ropes = new Dictionary<RopeConfig, nint>();
         var mem = new List<NativeBuffer>();
         try
@@ -500,16 +523,16 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
             var x = new NativeBuffer((long)n * d * 4); mem.Add(x);
             NativeBuffer? ple = _c.NEmbdPerLayer > 0 ? new NativeBuffer((long)n * _c.NLayer * _c.NEmbdPerLayer * 4) : null;
             if (ple != null) mem.Add(ple);
-            var logits = new NativeBuffer((long)n * Math.Max(_c.NVocab, 1) * 4); mem.Add(logits);
-            foreach (int count in new[] { n, 9, 4, 2, 1 })
+            using var logits = _output != null ? new NativeBuffer((long)_c.NVocab * sizeof(float), zero: false) : null;
+            foreach (int count in new[] { n, 9, 4, 2, 1 }.Distinct())
             {
-                // the prompt at positions 0..n-1, then the smaller batches after it
+                if (count > n) continue;
                 var seqs = Enumerable.Repeat(seq, count).ToArray();
-                var pos = Enumerable.Range(count == n ? 0 : n, count).ToArray();
+                var pos = Enumerable.Range(count == n ? 0 : Math.Min(n, warmTokens - count), count).ToArray();
                 Forward(new OffloadBatch
                 {
                     X = x.F, N = count, Sequences = seqs, Positions = pos, RopeCaches = ropes, PerLayerInputs = ple != null ? ple.F : null,
-                    OutputRows = _output != null ? [count - 1] : null, Logits = _output != null ? logits.F : null,
+                    OutputRows = logits != null ? [count - 1] : null, Logits = logits != null ? logits.F : null,
                 });
             }
         }
@@ -660,7 +683,9 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     private static long MatrixBytes(WeightTensor? w) =>
         w == null ? 0 : (long)DevFormat.RowWords(DevFormat.For(w.Type, w.Cols), w.Cols) * w.Rows * 4;
 
-    /// <summary>Estimated device bytes of layer <paramref name="il"/>: weights, KV pages (fp16) or recurrent arenas.</summary>
+    private static long CacheWords(long elements, bool q8) => q8 ? elements / 32 * 17 : elements;
+
+    /// <summary>Estimated device bytes for a layer's weights, KV pages or recurrent arenas.</summary>
     public static long EstimateLayerBytes(Model model, int il, OffloadGeometry g)
     {
         var c = model.Config;
@@ -670,7 +695,7 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
         if (c.Kinds[il] == LayerKind.Attention)
         {
             if (c.KvSourceLayer[il] == il)
-                b += (long)g.PageCount * g.PageSize * c.NHeadKv[il] * (c.HeadDimK[il] + c.HeadDimV[il]) * 2;
+                b += CacheWords((long)g.PageCount * g.PageSize * c.NHeadKv[il] * (c.HeadDimK[il] + c.HeadDimV[il]), g.KvCacheType == KvCacheType.Q8_0) * 2;
         }
         else
         {
@@ -695,6 +720,11 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
         }
         // scratch: activations for the max batch, logits tile, attention partials (generous upper bound)
         long scratch = (long)g.MaxBatch * (8L * _c.NEmbd + 4L * _c.NFf.DefaultIfEmpty(0).Max() + 16384) * 4 + 8L * _c.NVocab * 4 + (64L << 20);
+        if (_kvQ8)
+        {
+            int width = Enumerable.Range(0, supported).Select(i => _c.NHeadKv[i] * Math.Max(_c.HeadDimK[i], _c.HeadDimV[i])).DefaultIfEmpty().Max();
+            scratch += (long)g.MaxBatch * 4 * width;
+        }
         long budget = free == long.MaxValue ? long.MaxValue : free - o.ReserveBytes - scratch;
         if ((g.Resources ?? ResourceLimiter.Default).MaxDeviceMemoryBytes is long cap) budget = Math.Min(budget, cap - scratch);   // ResourceLimiter
         long used = 0;
@@ -729,6 +759,12 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     public static ILayerOffload? TryCreate(Model model, OffloadGeometry geometry, GpuOffloadOptions? options)
     {
         var log = LammaLogging.Create<GpuLayerOffload>(geometry.LoggerFactory);
+        if (SupportedLayerPrefix(model.Config) == 0)
+        {
+            LastUnavailableReason = $"no supported GPU layers for {model.Config.Architecture}";
+            Log.AcceleratorUnavailable(log, LastUnavailableReason);
+            return null;
+        }
         try
         {
             using (var probe = Context.Create(b => b.Cuda()))
@@ -760,12 +796,12 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     public bool OwnsKv(int layer) => layer < _layers && _c.KvSourceLayer[layer] == layer;
 
     /// <summary>Device memory used by weights, caches and scratch buffers.</summary>
-    public long DeviceBytes => _owned.Sum(b => b.LengthInBytes);
+    public long DeviceBytes => _owned.Sum(b => b.LengthInBytes) + _gemm.ScratchBytes + _matVec.ScratchBytes;
 
     private MemoryBuffer1D<T, Stride1D.Dense> Alloc<T>(long n) where T : unmanaged
     {
         var b = _acc.Allocate1D<T>(Math.Max(n, 4));
-        b.MemSetToZero();
+        b.MemSetToZero(_stream);
         _owned.Add(b);
         return b;
     }
@@ -799,7 +835,7 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                 mats[i] = new DMat { Buf = buf, Word = off, Rows = w.Rows, Cols = w.Cols, RowWords = rw, Type = types[i] };
                 off += (long)rw * w.Rows;
             }
-        buf.View.CopyFromCPU(host);
+        buf.View.CopyFromCPU(_stream, host);
         return buf;
     }
 
@@ -1308,11 +1344,20 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
             N = n, NHead = nh, NKv = nkv, Hd = hk, HdV = hv, QStride = qStride, KStride = kStride, VStride = vStride,
             QHeadPitch = gated ? 2 * hk : hk, KRow = kDim, VRow = vDim, OwnKv = own ? 1 : 0, VNorm = _c.VNorm ? 1 : 0,
             RopeDims = rope?.Dims ?? 0, RopeNeox = rope != null && rope.Mode != RopeMode.Normal ? 1 : 0, RopeStride = rope?.Dims ?? 0,
-            Eps = _c.RmsEps,
+            Eps = _c.RmsEps, DenseKvRows = _kvQ8 ? 1 : 0,
         };
         int units = n * (nh + (own ? 2 * nkv : 0));
-        _kQkv(_stream, Warps(units), _f.View, qBuf, qBuf, qBuf, _rope.View, S.KCache!.View, S.VCache!.View, _slots.View, qp);
+        var keys = S.KCache!.View;
+        var values = S.VCache!.View;
+        _kQkv(_stream, Warps(units), _f.View, qBuf, qBuf, qBuf, _rope.View,
+            _kvQ8 ? _keyRows!.View : keys, _kvQ8 ? _valueRows!.View : values, _slots.View, qp);
+        if (_kvQ8 && own)
+        {
+            _packKv!(_stream, Warps((long)n * kDim / 32), _keyRows!.View, keys, _slots.View, kDim, n);
+            _packKv!(_stream, Warps((long)n * vDim / 32), _valueRows!.View, values, _slots.View, vDim, n);
+        }
         Mark("qkv_post");
+        _scaleQueryTemperature?.Invoke(_stream, n * qDim, qBuf, _infoFull.View, qDim, qStride, rope?.NCtxOrig ?? 1, _c.AttentionTemperatureScale);
 
         float scale = _c.AttentionScale != 0 ? _c.AttentionScale : 1f / MathF.Sqrt(hk);
         var ap = new AttnParams
@@ -1328,7 +1373,7 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
             Mark("attn");
             return;
         }
-        if (_tileCount > 0 && hk == hv && hk <= Kernels.PrefillMaxHd && hk % 8 == 0)
+        if (!_kvQ8 && _tileCount > 0 && hk == hv && hk <= Kernels.PrefillMaxHd && hk % 8 == 0)
         {
             _kPrefill(_stream, new KernelConfig(_tileCount * nh, 128), qBuf, S.KCache.View, S.VCache.View, _pages.View, info.View, _tiles!.View, _att.View, ap, SpecializedValue.New(hk));
             Mark("attn");
@@ -1367,6 +1412,12 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
                 if (L.KCache == null || rope == null) continue;
                 if (!rots.TryGetValue(rope, out var rot)) rots[rope] = rot = _acc.Allocate1D(rope.ShiftRotation(delta));
                 int nkv = _c.NHeadKv[il];
+                if (_kvQ8)
+                {
+                    _rotateQ8!(_stream, Warps((long)slots.Length * nkv), L.KCache.View, ds.View, rot.View,
+                        slots.Length, nkv, _c.HeadDimK[il], rope.Dims, rope.Mode != RopeMode.Normal ? 1 : 0);
+                    continue;
+                }
                 _kRotateK(_stream, slots.Length * nkv * (rope.Dims / 2), L.KCache.View, ds.View, rot.View, slots.Length, nkv, _c.HeadDimK[il], rope.Dims,
                     rope.Mode != RopeMode.Normal ? 1 : 0);
             }
@@ -1383,9 +1434,17 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
     {
         _acc.Bind();
         int n = _c.NHeadKv[layer] * _c.HeadDimK[layer];
-        var h = new Half[n];
-        _dl[layer].KCache!.View.SubView((long)slot * n, n).CopyToCPU(_stream, h);
+        int words = (int)CacheWords(n, _kvQ8);
+        var h = new Half[words];
+        _dl[layer].KCache!.View.SubView((long)slot * words, words).CopyToCPU(_stream, h);
         _stream.Synchronize();
+        if (_kvQ8)
+        {
+            var bytes = System.Runtime.InteropServices.MemoryMarshal.Cast<Half, sbyte>(h.AsSpan());
+            var result = new float[n];
+            for (int i = 0; i < n; i++) result[i] = (float)h[i / 32 * 17] * bytes[i / 32 * 34 + 2 + i % 32];
+            return result;
+        }
         return h.Select(v => (float)v).ToArray();
     }
 
@@ -1397,6 +1456,8 @@ public sealed unsafe partial class GpuLayerOffload : ILayerOffload, IRecurrentSt
             var L = _dl[il];
             if (L.KCache == null) continue;
             long kRow = (long)_c.NHeadKv[il] * _c.HeadDimK[il], vRow = (long)_c.NHeadKv[il] * _c.HeadDimV[il];
+            kRow = CacheWords(kRow, _kvQ8);
+            vRow = CacheWords(vRow, _kvQ8);
             _kPageCopy(_stream, (int)(slots * kRow), L.KCache.View, (long)src * _pageSize * kRow, (long)dst * _pageSize * kRow);
             _kPageCopy(_stream, (int)(slots * vRow), L.VCache!.View, (long)src * _pageSize * vRow, (long)dst * _pageSize * vRow);
         }

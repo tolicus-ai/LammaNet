@@ -402,7 +402,9 @@ public unsafe class GpuKernelTests : IDisposable
     [InlineData(64, 1, false, 0f)]
     [InlineData(128, 3, true, 0f)]
     [InlineData(256, 5, false, 20f)]
-    public void AttentionMatchesReference(int hd, int chunks, bool gated, float softCap)
+    [InlineData(64, 1, false, 0f, true)]
+    [InlineData(128, 3, true, 20f, true)]
+    public void AttentionMatchesReference(int hd, int chunks, bool gated, float softCap, bool compact = false)
     {
         var rnd = new Random(hd + chunks);
         int nh = 4, nkv = 2, ctx = 70, ps = 16, n = 2;
@@ -418,6 +420,12 @@ public unsafe class GpuKernelTests : IDisposable
                 {
                     K[p, g, i] = (float)(Half)(float)(rnd.NextDouble() - 0.5);
                     V[p, g, i] = (float)(Half)(float)(rnd.NextDouble() - 0.5);
+                    if (compact)
+                    {
+                        // Exactly representable Q8_0 blocks isolate indexing, packing and attention math.
+                        K[p, g, i] = (i % 32 == 0 ? 127 : rnd.Next(-127, 128)) / 256f;
+                        V[p, g, i] = (i % 32 == 0 ? -127 : rnd.Next(-127, 128)) / 512f;
+                    }
                     long slot = pages[p / ps] * ps + p % ps;
                     kc[(slot * nkv + g) * hd + i] = (Half)K[p, g, i];
                     vc[(slot * nkv + g) * hd + i] = (Half)V[p, g, i];
@@ -435,9 +443,20 @@ public unsafe class GpuKernelTests : IDisposable
         using var dp = _acc.Allocate1D(pages); using var di = _acc.Allocate1D(info);
         using var dout = _acc.Allocate1D<float>(n * nh * hd);
         using var dpart = _acc.Allocate1D<float>(n * nh * chunks * (2 + hd));
-        var attn = _acc.LoadStreamKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams>(Kernels.AttnDecode);
+        using var packedK = compact ? _acc.Allocate1D<Half>(kc.Length / 32 * 17) : null;
+        using var packedV = compact ? _acc.Allocate1D<Half>(vc.Length / 32 * 17) : null;
+        if (compact)
+        {
+            using var slots = _acc.Allocate1D(Enumerable.Range(0, nPages * ps).ToArray());
+            var pack = _acc.LoadStreamKernel<ArrayView<Half>, ArrayView<Half>, ArrayView<int>, int, int>(Kernels.PackKvQ8);
+            var shape = new KernelConfig((kc.Length / 32 + 3) / 4, Kernels.GroupSize);
+            pack(shape, dk.View, packedK!.View, slots.View, nkv * hd, nPages * ps);
+            pack(shape, dv.View, packedV!.View, slots.View, nkv * hd, nPages * ps);
+            _acc.Synchronize();
+        }
+        var attn = _acc.LoadStreamKernel<ArrayView<float>, ArrayView<Half>, ArrayView<Half>, ArrayView<int>, ArrayView<int>, ArrayView<float>, ArrayView<float>, AttnParams>(compact ? Kernels.AttnKvQ8 : Kernels.AttnDecode);
         var comb = _acc.LoadStreamKernel<ArrayView<float>, ArrayView<float>, ArrayView<float>, AttnParams>(Kernels.AttnCombine);
-        attn(new KernelConfig(n * ((nh + 3) / 4) * chunks, Kernels.GroupSize), dq.View, dk.View, dv.View, dp.View, di.View, dout.View, dpart.View, prm);
+        attn(new KernelConfig(n * ((nh + 3) / 4) * chunks, Kernels.GroupSize), dq.View, (packedK ?? dk).View, (packedV ?? dv).View, dp.View, di.View, dout.View, dpart.View, prm);
         if (chunks > 1) comb(new KernelConfig((n * nh + 3) / 4, Kernels.GroupSize), dq.View, dpart.View, dout.View, prm);
         _acc.Synchronize();
         var o = dout.GetAsArray1D();

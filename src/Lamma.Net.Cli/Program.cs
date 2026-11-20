@@ -33,6 +33,10 @@ public static class Program
 
     private static int Run(string[] args)
     {
+        int optionStart = args[0] switch { "ask" => 3, "bench" => 4, "gpucheck" => 2, _ => args.Length };
+        int compact = Array.IndexOf(args, "--compact-kv", Math.Min(optionStart, args.Length));
+        KvCacheType kv = compact >= 0 ? KvCacheType.Q8_0 : KvCacheType.F16;
+        if (compact >= 0) args = [.. args[..compact], .. args[(compact + 1)..]];
         return args[0] switch
         {
             "logits" => Logits(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 0, args.Contains("--all")),
@@ -48,14 +52,15 @@ public static class Program
             "stt" => Demos.SpeechToText(args[1], args[2], args[3]).GetAwaiter().GetResult(),
             "realtime" => Demos.Realtime(args[1], args[2], args[3]).GetAwaiter().GetResult(),
             "ask" => Ask(args[1], args[2], args.Contains("--tools"), args.Contains("--think"),
-                Opt(args, "--mmproj"), Opt(args, "--image"), Opt(args, "--audio"), args.Contains("--special")).GetAwaiter().GetResult(),
+                Opt(args, "--mmproj"), Opt(args, "--image"), Opt(args, "--audio"), args.Contains("--special"), kv,
+                Opt(args, "--ctx") is { } ctx ? int.Parse(ctx) : 4096).GetAwaiter().GetResult(),
             "encode" => EncodeMedia(args[1], args[2], args[3], Opt(args, "--repeat") is { } rp ? int.Parse(rp) : 3, Opt(args, "--max-tokens") is { } mt ? int.Parse(mt) : null,
                 Opt(args, "--save"), Opt(args, "--compare")),
             "allocs" => Allocs(args[1], args.Length > 2 ? int.Parse(args[2]) : 512, args.Length > 3 ? int.Parse(args[3]) : 256, args.Contains("--gpu")).GetAwaiter().GetResult(),
             "pull" => Pull(args[1], args.Contains("--dry-run"), args.Contains("--no-mmproj")).GetAwaiter().GetResult(),
-            "bench" => Bench(args[1], int.Parse(args[2]), int.Parse(args[3])),
+            "bench" => Bench(args[1], int.Parse(args[2]), int.Parse(args[3]), kv),
             "enginecheck" => EngineCheck.Run(args[1], args.Length > 2 ? int.Parse(args[2]) : 64).GetAwaiter().GetResult(),
-            "gpucheck" => GpuCheck(args[1], args.Length > 2 ? int.Parse(args[2]) : -1, args.Length > 3 ? int.Parse(args[3]) : 32),
+            "gpucheck" => GpuCheck(args[1], args.Length > 2 ? int.Parse(args[2]) : -1, args.Length > 3 ? int.Parse(args[3]) : 32, kv),
             "gpu-kstats" => PrintLines(LammaNet.Gpu.GpuBench.KernelStats()),
             "gpu-peak" => PrintLines(LammaNet.Gpu.GpuBenchPeaks.Run()),
             "spec" => Spec(args[1], args[2], args.Length > 3 && int.TryParse(args[3], out var ng) ? ng : 128, args.Contains("--gpu"),
@@ -169,14 +174,17 @@ public static class Program
         return 0;
     }
 
-    private static int Bench(string modelPath, int nPrompt, int nGen)
+    private static int Bench(string modelPath, int nPrompt, int nGen, KvCacheType kvType)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(nPrompt);
+        ArgumentOutOfRangeException.ThrowIfNegative(nGen);
         using var model = Model.Load(modelPath);
         int threads = int.TryParse(Environment.GetEnvironmentVariable("LAMMA_THREADS"), out var nt) ? nt : ComputePool.DefaultThreadCount();
-        var pool = new ComputePool(threads);
-        int maxBatch = Math.Min(512, Math.Max(nPrompt, 1)), pageSize = 32, pages = (nPrompt + nGen + 64 + 2 * pageSize) / pageSize;
-        using var offload = GpuFromEnv(model, pageSize, pages, maxBatch);
-        using var kv = new KvCache(model.Config, nPrompt + nGen + 64, KvCacheType.F16, pageSize, offload == null ? null : l => !offload.OwnsKv(l), offload?.RecurrentStore);
+        using var pool = new ComputePool(threads);
+        int maxBatch = Math.Min(512, nPrompt), pageSize = 32, capacity = checked(nPrompt + nGen + 64);
+        int pages = KvCache.PagesFor(capacity, pageSize);
+        using var offload = GpuFromEnv(model, new OffloadGeometry(pageSize, pages, maxBatch) { KvCacheType = kvType });
+        using var kv = new KvCache(model.Config, capacity, kvType, pageSize, offload == null ? null : l => !offload.OwnsKv(l), offload?.RecurrentStore);
         using var runner = new ModelRunner(model, kv, pool, maxBatch, 0, offload);
         var rnd = new Random(5);
         var batch = new Batch();
@@ -405,17 +413,21 @@ public static class Program
                 : $"\r-- {p.File}: {p.BytesDownloaded / 1e6:F0} MB");
     }
 
-    private static async Task<int> Ask(string modelPath, string question, bool tools, bool think, string? mmproj, string? image, string? audio, bool special = false)
+    private static async Task<int> Ask(string modelPath, string question, bool tools, bool think, string? mmproj, string? image, string? audio, bool special, KvCacheType kvType, int contextSize)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(contextSize);
         modelPath = ModelArg(modelPath, mmproj == null && (image != null || audio != null), out var cachedMmproj);
         mmproj ??= cachedMmproj;
         using var engine = InferenceEngine.Load(modelPath, new EngineOptions
         {
-            ContextSize = 4096,
+            // The one-shot CLI serves one sequence. Its entire prompt and decode fit in one context.
+            ContextSize = contextSize, KvCacheTokens = contextSize, KvCacheType = kvType,
             SpeculativeDraftTokens = int.TryParse(Environment.GetEnvironmentVariable("LAMMA_SPEC"), out var spec) ? spec : null,
             Offload = GpuFactoryFromEnv(),
         });
         Console.Error.WriteLine(engine.Offload is { } dev ? $"-- {dev.DeviceName}: {dev.LayerCount}/{engine.Config.NLayer} layers" : $"-- CPU ({LammaNet.Gpu.GpuLayerOffload.LastUnavailableReason ?? "no accelerator"})");
+        if (engine.Offload is LammaNet.Gpu.GpuLayerOffload gpu)
+            Console.Error.WriteLine($"-- {kvType} KV, context {contextSize}, allocated device buffers {gpu.DeviceBytes / (1024 * 1024)} MiB at startup");
         var chat = new LammaNet.Chat.ChatEngine(engine);
         if (mmproj != null) chat.MediaEncoders.Add(LammaNet.Multimodal.MultimodalProjector.Load(mmproj, engine));
         var toolDefs = tools ? new List<LammaNet.Chat.ToolDefinition>
@@ -454,16 +466,21 @@ public static class Program
     {
         var spec = Environment.GetEnvironmentVariable("LAMMA_GPU");
         if (string.IsNullOrEmpty(spec)) return null;
-        return (m, g) => GpuFromEnv(m, g.PageSize, g.PageCount, g.MaxBatch, spec)!;
+        return (model, geometry) => GpuFromEnv(model, geometry, spec);
     }
 
     /// <summary>LAMMA_GPU=&lt;layers&gt;[:cpu] → offload the first layers via ILGPU (-1 = all supported; ":cpu" = kernel emulation).</summary>
-    private static LammaNet.Inference.ILayerOffload? GpuFromEnv(Model model, int pageSize, int pages, int maxBatch, string? spec = null)
+    private static ILayerOffload? GpuFromEnv(Model model, OffloadGeometry geometry, string? spec = null)
     {
         spec ??= Environment.GetEnvironmentVariable("LAMMA_GPU");
         if (string.IsNullOrEmpty(spec)) return null;
+        if (LammaNet.Gpu.GpuLayerOffload.SupportedLayerPrefix(model.Config) == 0)
+        {
+            Console.Error.WriteLine($"Running {model.Config.Architecture} on CPU.");
+            return null;
+        }
         var parts = spec.Split(':');
-        var offload = new LammaNet.Gpu.GpuLayerOffload(model, new LammaNet.Inference.OffloadGeometry(pageSize, pages, maxBatch), new LammaNet.Gpu.GpuOffloadOptions
+        var offload = new LammaNet.Gpu.GpuLayerOffload(model, geometry, new LammaNet.Gpu.GpuOffloadOptions
         {
             Layers = int.Parse(parts[0]),
             ReserveBytes = (long.TryParse(Environment.GetEnvironmentVariable("LAMMA_GPU_RESERVE_MB"), out var rmb) ? rmb : 384) << 20,
@@ -471,16 +488,18 @@ public static class Program
                 : parts[1] == "cpu" ? LammaNet.Gpu.GpuDevice.CpuEmulation : LammaNet.Gpu.GpuDevice.Cuda,
         });
         Console.Error.WriteLine($"offloading {offload.LayerCount}/{model.Config.NLayer} layers to {offload.DeviceName} [{offload.Plan}]");
-        return offload;
+        if (offload.LayerCount > 0) return offload;
+        offload.Dispose();
+        return null;
     }
 
     /// <summary>GPU-vs-CPU logit check (see <see cref="LammaNet.Gpu.GpuValidation"/>); layers -1 = all supported.</summary>
-    private static int GpuCheck(string modelPath, int layers, int nGen)
+    private static int GpuCheck(string modelPath, int layers, int nGen, KvCacheType kvType)
     {
         using var model = Model.Load(modelPath);
         var r = LammaNet.Gpu.GpuValidation.Compare(model, new LammaNet.Gpu.GpuOffloadOptions { Layers = layers }, nGen,
             Environment.GetEnvironmentVariable("LAMMA_PROMPT") ?? LammaNet.Gpu.GpuValidation.DefaultPrompt,
-            int.TryParse(Environment.GetEnvironmentVariable("LAMMA_THREADS"), out var nt) ? nt : 0);
+            int.TryParse(Environment.GetEnvironmentVariable("LAMMA_THREADS"), out var nt) ? nt : 0, kvType);
         Console.WriteLine($"CPU: {r.CpuText.ReplaceLineEndings(" ")}");
         Console.WriteLine($"cpu-dec  {r.CpuDecode}  (CPU decode, Q8 activations)");
         Console.WriteLine($"offloading {r.OffloadedLayers}/{model.Config.NLayer} layers to {r.Device}");
@@ -538,7 +557,7 @@ public static class Program
     {
         using var model = Model.Load(modelPath);
         var pool = new ComputePool(ComputePool.DefaultThreadCount());
-        using var offload = GpuFromEnv(model, 32, 4096 / 32, 512);
+        using var offload = GpuFromEnv(model, new OffloadGeometry(32, 4096 / 32, 512));
         using var kv = new KvCache(model.Config, 4096, KvCacheType.F16, 32, offload == null ? null : l => !offload.OwnsKv(l), offload?.RecurrentStore);
         using var runner = new ModelRunner(model, kv, pool, 512, 0, offload);
         using var seq = new SequenceState(kv, model.Config);
@@ -611,7 +630,7 @@ public static class Program
         Console.Error.WriteLine($"loaded {model} in {sw.ElapsedMilliseconds} ms");
         var pool = new ComputePool(int.TryParse(Environment.GetEnvironmentVariable("LAMMA_THREADS"), out var nt) ? nt : ComputePool.DefaultThreadCount());
         int pageSize = 32, pages = 4096 / 32;
-        var offload = GpuFromEnv(model, pageSize, pages, 512);
+        var offload = GpuFromEnv(model, new OffloadGeometry(pageSize, pages, 512));
         var off = offload;
         using var kv = new KvCache(model.Config, 4096, KvCacheType.F16, pageSize, off == null ? null : l => !off.OwnsKv(l), off?.RecurrentStore);
         using var runner = new ModelRunner(model, kv, pool, 512, 0, offload);

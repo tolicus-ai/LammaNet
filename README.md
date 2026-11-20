@@ -6,7 +6,7 @@ Pure C# (.NET 10) in-process inference engine for GGUF models, with Microsoft.Ex
 - **Models (verified against llama.cpp / exact float64 reference):** Llama 3.x, Qwen3, Qwen3.5/3.6 family (Gated DeltaNet hybrid), Granite 4 (dense + Mamba2 hybrid), Gemma 2/3/4, LFM2/LFM2.5 (short-conv hybrid), EmbeddingGemma 2 (bidirectional embeddings), granite-docling (document pages → DocTags).
 - **Quantization:** F32/F16/BF16, Q4_0/1, Q5_0/1, Q8_0, Q2_K–Q6_K, IQ4_NL/XS. AVX2/FMA (+AVX-VNNI) int8 kernels; packed float GEMM for prefill.
 - **Engine:** paged KV cache (F16/F32/Q8_0) with prefix reuse, recurrent-state snapshots for hybrid models, continuous batching, chunked prefill, flash-decoding attention, sliding window, shared KV (Gemma 4), speculative decoding (prompt lookup), context shift (opt-in).
-- **GPU (Lamma.Net.Gpu, NVIDIA/CUDA via ILGPU — kernels written in C#):** every supported layer kind on the device (attention, Gated DeltaNet, Mamba2) incl. LM head and Gemma per-layer inputs; fp16 paged KV cache; recurrent states in device slots; CUDA graphs for decode; tensor-core (mma.sync) GEMM and flash attention for prompts on sm_80+; automatic CPU/GPU split fitted to free VRAM. Used automatically when the package is referenced and a CUDA device is present (`LAMMA_DEVICE=cpu` disables).
+- **GPU (Lamma.Net.Gpu, NVIDIA/CUDA via ILGPU — kernels written in C#):** attention, Gated DeltaNet and Mamba2 layers, LM head and Gemma per-layer inputs. Supports FP16 and Q8_0 paged KV caches, recurrent states in device slots, CUDA graphs for decode, and tensor-core GEMM and flash attention for prompts on sm_80+. The engine fits the CPU/GPU split to free VRAM. Used automatically when the package is referenced and a CUDA device is present (`LAMMA_DEVICE=cpu` disables).
 - **Chat:** Jinja2 chat templates from GGUF (conformance-tested against Python jinja2), reasoning + tool-call parsing (Hermes JSON, Qwen XML, Llama JSON, Gemma 4), JSON-constrained decoding.
 - **Multimodal:** Gemma 4 vision and audio encoders, Qwen3.5/3.6 vision (Qwen3-VL merger), Idefics3 / granite-docling (SigLIP, tiled pages) — mmproj GGUF; the encoder transformers run on the GPU when the model does. Image preprocessing reproduces Pillow/llama.cpp exactly.
 - **Microsoft.Extensions.AI:** `IChatClient`, `IEmbeddingGenerator`, `ISpeechToTextClient`, `IRealtimeClient` (full duplex, VAD, barge-in), DI helpers; works with `Microsoft.Agents.AI`.
@@ -25,9 +25,54 @@ Pure C# (.NET 10) in-process inference engine for GGUF models, with Microsoft.Ex
 llama.cpp with a ~460-token prompt (\* ~700-token prompt, earlier run). Measured ceilings of this card (`lamma gpu-peak`): fp16→fp32 tensor cores 41.7 TFLOPS, int8 170 TOPS.
 Projections of normalized inputs (q/k/v, FFN gate/up, LM head) use 8-bit integer activations: dp4a matrix-vector kernels
 for generation and an int8 tensor-core GEMM (Q4_K, Q4_0, Q8_0) for prompts, 21-33 TOPS effective vs 17-24 TFLOPS for
-the fp16 GEMM on the same shapes, which the remaining projections use (`GpuOffloadOptions.Int8`: Off / Normalized (default) / All, see
-docs/notes.md §16 for the accuracy trade-off). On the CPU (8-core i7-9700K) prompt processing is at 90-100% of llama.cpp and
+the fp16 GEMM on the same shapes, which the remaining projections use. `GpuOffloadOptions.Int8` defaults to `Auto`.
+It selects float activations for Gemma 3 with Q4_0 query weights and normalized int8 projections elsewhere. Set
+`Int8` explicitly or use `LAMMA_GPU_Q8=off|normalized|all` to override the activation choice. On the CPU (8-core i7-9700K) prompt processing is at 90-100% of llama.cpp and
 generation on par.
+
+### Choosing KV cache capacity
+
+FP16 is the default. For a longer context or more layers on the GPU, pass `--compact-kv` to `ask`, `bench`, or `gpucheck`. This command requests a 16,384-token context with a Q8_0 cache.
+
+```powershell
+lamma ask D:\Models\granite-4.2-8b-Q4_K_M.gguf "Summarize the following text..." --ctx 16384 --compact-kv
+```
+
+In the .NET API, set `EngineOptions.KvCacheType = KvCacheType.Q8_0` and set `ContextSize` to the per-sequence limit. Both host and CUDA layers use 34 bytes per 32 cached values, compared with 64 bytes for FP16. Host layers with incompatible head widths fall back to FP16. Model weights keep their original precision. CUDA can fit more layers with the smaller cache, though reading compressed values adds compute and quantization can change the next token. Use `gpucheck` with the model and cache mode you intend to run.
+
+The one-shot `ask` command reserves one context of cache, rounded up to a page. The multi-request .NET engine defaults to two contexts of pooled cache and accepts an explicit `KvCacheTokens` budget.
+
+Granite 4.2 8B Q4_K_M on an RTX 3070 with 7,114 MiB free produced the same 119-token completion in each run below. The prompt occupied 34 tokens. Context is the reserved capacity. Device memory counts engine buffers at startup.
+
+| Context | KV cache | GPU placement | Device MiB | Decode tokens/s |
+|---:|---|---|---:|---:|
+| 8,192 | FP16 | 40/40 layers + output head | 6,287 | 55.7 |
+| 8,192 | Q8_0 | 40/40 layers + output head | 5,689 | 54.3 |
+| 16,384 | FP16 | 36/40 layers | 6,503 | 10.8 |
+| 16,384 | Q8_0 | 40/40 layers + output head | 6,369 | 54.6 |
+
+On Gemma 3 4B Q4_0, prefer FP16 KV for the closest match to the CPU reference. In a 32-position comparison, default GPU prefill matched the top token 32 times with FP16 and 31 times with Q8_0. The maximum logit differences were 0.018 and 0.301. Phi-2 uses CPU inference and its 80-wide heads use FP16 in both modes.
+
+<details>
+<summary>RTX 3070 cache benchmarks across 11 GGUF files</summary>
+
+Median tokens/s from three runs per mode, one sequence, a 512-token prompt and 32 decode steps. The weight format in the first column is the format on disk. For reproduction, set `$env:LAMMA_GPU = '-1:cuda'` in PowerShell and run `lamma bench <file> 512 32`, then repeat with `--compact-kv`. Automatic layer placement depends on available VRAM.
+
+| Model and weights | FP16 prompt | Q8 cache prompt | FP16 decode | Q8 cache decode |
+|---|---:|---:|---:|---:|
+| Gemma 3 270M Q4_K_M | 26,831 | 23,765 | 540.1 | 446.2 |
+| Gemma 3 4B Q4_0 | 2,842 | 2,758 | 77.9 | 76.7 |
+| Granite 4.2 3B Q4_K_M | 3,163 | 3,064 | 120.0 | 112.0 |
+| Granite 4.2 3B Q8_0 | 3,108 | 3,036 | 83.7 | 81.4 |
+| Granite 4.2 8B Q4_K_M | 1,502 | 1,448 | 56.1 | 53.9 |
+| Granite 4.2 8B Q8_0 (CPU/GPU split) | 156 | 135 | 5.6 | 6.6 |
+| Granite Vision 4.1 4B Q4_K_M (text) | 3,126 | 2,978 | 117.7 | 109.3 |
+| Granite Vision 4.1 4B Q8_0 (text) | 3,131 | 2,962 | 85.5 | 79.1 |
+| Ministral 3 3B Q4_K_M | 3,352 | 3,184 | 124.8 | 118.8 |
+| Phi-2 Q4_K_M (CPU, FP16 cache in both runs) | 101 | 90 | 12.0 | 11.4 |
+| Qwen3 8B Q4_K_M | 1,687 | 1,648 | 60.4 | 59.5 |
+
+</details>
 
 ## Quick start
 ```csharp

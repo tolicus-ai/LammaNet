@@ -63,24 +63,37 @@ public sealed class Sampler
     public int Sample(ReadOnlySpan<float> logits)
     {
         int n = logits.Length;
-        if (_buf.Length < n) _buf = new float[n];
-        var l = _buf.AsSpan(0, n);
-        logits.CopyTo(l);
-        if (_o.LogitBias != null)
-            foreach (var (id, b) in _o.LogitBias) if ((uint)id < (uint)n) l[id] += b;
-        ApplyPenalties(l);
-        if (_o.DryMultiplier > 0) ApplyDry(l);
+        bool adjust = _o.LogitBias is { Count: > 0 } || _o.RepetitionPenalty != 1f ||
+            _o.FrequencyPenalty != 0 || _o.PresencePenalty != 0 || _o.DryMultiplier > 0;
+        if (adjust)
+        {
+            var l = CopyLogits(logits);
+            if (_o.LogitBias != null)
+                foreach (var (id, b) in _o.LogitBias) if ((uint)id < (uint)n) l[id] += b;
+            ApplyPenalties(l);
+            if (_o.DryMultiplier > 0) ApplyDry(l);
+            logits = l;
+        }
 
-        int pick = SampleFrom(l, constrained: false);
+        int pick = SampleFrom(logits);
         if (Constraint != null && !Allowed(pick))
         {
+            var l = adjust ? _buf.AsSpan(0, n) : CopyLogits(logits);
             for (int i = 0; i < n; i++) if (!Allowed(i)) l[i] = float.NegativeInfinity;
-            pick = SampleFrom(l, constrained: true);
+            pick = SampleFrom(l);
         }
         return pick;
     }
 
-    private int SampleFrom(Span<float> l, bool constrained)
+    private Span<float> CopyLogits(ReadOnlySpan<float> logits)
+    {
+        if (_buf.Length < logits.Length) _buf = new float[logits.Length];
+        var copy = _buf.AsSpan(0, logits.Length);
+        logits.CopyTo(copy);
+        return copy;
+    }
+
+    private int SampleFrom(ReadOnlySpan<float> l)
     {
         int n = l.Length;
         if (_o.Temperature <= 0 || _o.TopK == 1)
@@ -166,7 +179,7 @@ public sealed class Sampler
     }
 
     /// <summary>Selects the k largest logits into <see cref="_cand"/> using a size-k min-heap.</summary>
-    private int TopK(Span<float> l, int k)
+    private int TopK(ReadOnlySpan<float> l, int k)
     {
         var heap = new PriorityQueue<int, float>(k + 1);
         for (int i = 0; i < l.Length; i++)

@@ -9,10 +9,10 @@ namespace LammaNet.Gpu;
 /// <summary>Logit deviation of one run from the reference.</summary>
 public readonly record struct LogitDeviation(double Max, double Mean, int Top1Agree, int Count)
 {
-    public override string ToString() => $"top1 {Top1Agree}/{Count}  max|dlogit| {Max:F4}  mean {Mean:F4}";
+    public override string ToString() => $"top1 {Top1Agree}/{Count}  max|dlogit| {Max:F4}  mean row max {Mean:F4}";
 }
 
-/// <summary>Result of <see cref="GpuValidation.Compare"/>.</summary>
+/// <summary>Teacher-forced decode and prefill deviations measured by <see cref="GpuValidation"/>.</summary>
 public sealed record GpuValidationResult(string CpuText, int OffloadedLayers, string Device,
     LogitDeviation CpuDecode, LogitDeviation GpuDecode, LogitDeviation GpuPrefill, bool Int8 = false)
 {
@@ -40,10 +40,13 @@ public static class GpuValidation
     public const string DefaultPrompt =
         "Write a short story about a robot who learns to paint. The robot's name is Pixel and it lives in a lighthouse on a rocky coast.";
 
-    public static GpuValidationResult Compare(Model model, GpuOffloadOptions options, int nGen = 24, string prompt = DefaultPrompt, int threads = 0)
+    public static GpuValidationResult Compare(Model model, GpuOffloadOptions options, int nGen = 24, string prompt = DefaultPrompt, int threads = 0) =>
+        Compare(model, options, nGen, prompt, threads, KvCacheType.F16);
+
+    public static GpuValidationResult Compare(Model model, GpuOffloadOptions options, int nGen, string prompt, int threads, KvCacheType kvType)
     {
         var c = model.Config;
-        var pool = new ComputePool(threads > 0 ? threads : Environment.ProcessorCount);
+        using var pool = new ComputePool(threads > 0 ? threads : Environment.ProcessorCount);
         const int pageSize = 32, maxBatch = 512;
         var promptToks = model.Vocab.Tokenize(prompt);
         int ctx = Math.Max(1024, (promptToks.Count + nGen + 64 + pageSize - 1) / pageSize * pageSize);
@@ -67,7 +70,7 @@ public static class GpuValidation
 
         List<float[]> Run(ILayerOffload? off, IReadOnlyList<int>? forced, bool oneShot, out List<int> toks)
         {
-            using var kv = new KvCache(c, ctx, KvCacheType.F16, pageSize, off == null ? null : l => !off.OwnsKv(l), off?.RecurrentStore);
+            using var kv = new KvCache(c, ctx, off == null ? KvCacheType.F16 : kvType, pageSize, off == null ? null : l => !off.OwnsKv(l), off?.RecurrentStore);
             using var runner = new ModelRunner(model, kv, pool, maxBatch, 0, off);
             using var seq = new SequenceState(kv, c);
             toks = new List<int>(promptToks);
@@ -118,7 +121,7 @@ public static class GpuValidation
             }
             return new LogitDeviation(maxD, sumD / a.Count, agree, a.Count);
         }
-        using var off = new GpuLayerOffload(model, new OffloadGeometry(pageSize, ctx / pageSize, maxBatch), options);
+        using var off = new GpuLayerOffload(model, new OffloadGeometry(pageSize, ctx / pageSize, maxBatch) { KvCacheType = kvType }, options);
         var dec = Deviation(Run(off, gen, false, out _));
         var pre = Deviation(Run(off, gen, true, out _));
         return new GpuValidationResult(model.Vocab.Decode(gen), off.LayerCount, off.DeviceName, Deviation(cpu), dec, pre, off.UsesInt8Activations);

@@ -20,7 +20,15 @@ internal static partial class Kernels
     /// constant (multiple of 32, ≤ 256, == HdV). Grid: tiles × NHead.
     /// </summary>
     public static void TcAttnPrefill(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
-        ArrayView<int> tiles, ArrayView<float> outp, AttnParams p, SpecializedValue<int> hdSpec)
+        ArrayView<int> tiles, ArrayView<float> outp, AttnParams p, SpecializedValue<int> hdSpec) =>
+        TcAttnPrefillCore(q, kc, vc, pages, tokInfo, tiles, outp, p, hdSpec, 0);
+
+    internal static void TcAttnPrefillQ8(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<int> tiles, ArrayView<float> outp, AttnParams p, SpecializedValue<int> hdSpec) =>
+        TcAttnPrefillCore(q, kc, vc, pages, tokInfo, tiles, outp, p, hdSpec, 1);
+
+    private static void TcAttnPrefillCore(ArrayView<float> q, ArrayView<Half> kc, ArrayView<Half> vc, ArrayView<int> pages, ArrayView<int> tokInfo,
+        ArrayView<int> tiles, ArrayView<float> outp, AttnParams p, SpecializedValue<int> hdSpec, int compact)
     {
         int hd = hdSpec.Value;
         var qs = SharedMemory.Allocate<Half>(TaQ * TaQLd);
@@ -35,8 +43,6 @@ internal static partial class Kernels
         var kv32 = kvb.Cast<uint>();
         var kv8 = kvb.Cast<Half8>();
         var p32 = ps.Cast<uint>();
-        var k8 = kc.Cast<Half8>();
-        var v8 = vc.Cast<Half8>();
         int tid = Group.IdxX, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
         int tile = Grid.IdxX / p.NHead, h = Grid.IdxX % p.NHead;
         int t0 = tiles[2 * tile], cnt = tiles[2 * tile + 1];
@@ -64,7 +70,7 @@ internal static partial class Kernels
             {
                 int pp = e / (hd / 8), d8 = e % (hd / 8);
                 long sl = slots[pp];
-                kv8[pp * (TaKLd / 8) + d8] = sl >= 0 ? k8[(sl * p.KRow + (long)kvh * p.Hd) / 8 + d8] : default;
+                kv8[pp * (TaKLd / 8) + d8] = sl >= 0 ? LoadCache8(kc, (sl * p.KRow + (long)kvh * p.Hd) / 8 + d8, compact) : default;
             }
             Group.Barrier();
             // scores of positions 8w..8w+7: A = Q (rows g, g+8), B = K rows (n = position)
@@ -117,7 +123,7 @@ internal static partial class Kernels
             {
                 int d8 = e / TaKV, pp = e % TaKV;
                 long sl = slots[pp];
-                Half8 hv = sl >= 0 ? v8[(sl * p.VRow + (long)kvh * p.HdV) / 8 + d8] : default;
+                Half8 hv = sl >= 0 ? LoadCache8(vc, (sl * p.VRow + (long)kvh * p.HdV) / 8 + d8, compact) : default;
                 int d = d8 * 8;
                 kvb[(d + 0) * TaVLd + pp] = hv.H0; kvb[(d + 1) * TaVLd + pp] = hv.H1; kvb[(d + 2) * TaVLd + pp] = hv.H2; kvb[(d + 3) * TaVLd + pp] = hv.H3;
                 kvb[(d + 4) * TaVLd + pp] = hv.H4; kvb[(d + 5) * TaVLd + pp] = hv.H5; kvb[(d + 6) * TaVLd + pp] = hv.H6; kvb[(d + 7) * TaVLd + pp] = hv.H7;

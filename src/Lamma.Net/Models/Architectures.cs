@@ -7,6 +7,8 @@ namespace LammaNet.Models;
 /// </summary>
 public sealed record ArchitectureTraits
 {
+    /// <summary>Phi-2 feeds one affine layer norm into parallel attention and GELU MLP branches.</summary>
+    public bool Phi2 { get; init; }
     /// <summary>Gemma family: embeddings scaled by √d, GELU-gated FFN, rope scaling only on full-attention layers.</summary>
     public bool Gemma { get; init; }
     /// <summary>Attention scores unscaled (q/k RMS norms make 1/√d unnecessary; Gemma 4 family).</summary>
@@ -42,6 +44,7 @@ public sealed record ArchitectureTraits
     private static readonly Dictionary<string, ArchitectureTraits> s_known = new()
     {
         ["llama"] = new() { AddBosDefault = true },
+        ["phi2"] = new() { Phi2 = true },
         ["gemma"] = new() { Gemma = true, AddBosDefault = true },
         ["gemma2"] = new() { Gemma = true, AddBosDefault = true, SwaPeriod = 2 },
         ["gemma3"] = new() { Gemma = true, AddBosDefault = true, SwaPeriod = 6 },

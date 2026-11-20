@@ -68,6 +68,8 @@ public interface ILayerOffload : IDisposable
 /// <summary>KV-cache geometry handed to an offload factory.</summary>
 public sealed record OffloadGeometry(int PageSize, int PageCount, int MaxBatch)
 {
+    /// <summary>Requested precision. CUDA uses Q8_0 for compact KV and FP16 otherwise.</summary>
+    public KvCacheType KvCacheType { get; init; } = KvCacheType.F16;
     /// <summary>Logging of the engine creating the offload (null: <see cref="Diagnostics.LammaLogging.LoggerFactory"/>).</summary>
     public Microsoft.Extensions.Logging.ILoggerFactory? LoggerFactory { get; init; }
     /// <summary>Resource limits of the engine (device memory cap); null: <see cref="Compute.ResourceLimiter.Default"/>.</summary>

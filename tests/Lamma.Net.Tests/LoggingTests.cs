@@ -84,6 +84,12 @@ public sealed class LoggingTests
         Assert.Contains(capture.Entries, e => e.Id.Id == 1011 && e.Level == LogLevel.Warning && e.Exception is ArgumentException
             && e.Message.Contains($"request {rejected.RequestId} "));
 
+        foreach (int token in new[] { -1, engine.Config.NVocab })
+        {
+            var invalid = engine.Submit(new GenerationRequest { Prompt = new Prompt([token]) });
+            await Assert.ThrowsAsync<ArgumentException>(() => invalid.Completion);
+        }
+
         // sampling fails for one request: only that request fails, the other one completes
         var good = engine.Submit(new GenerationRequest { Prompt = P(engine, "The capital of France is"), MaxTokens = 6 });
         var bad = engine.Submit(new GenerationRequest { Prompt = P(engine, "One, two, three,"), MaxTokens = 6, Constraint = new ThrowingConstraint() });

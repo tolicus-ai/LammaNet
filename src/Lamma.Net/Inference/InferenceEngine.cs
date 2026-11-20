@@ -145,13 +145,16 @@ public sealed class InferenceEngine : IDisposable
         _log = LammaLogging.Create<InferenceEngine>(LoggerFactory);
         Resources = _opt.Resources ?? ResourceLimiter.Default;
         ContextSize = _opt.ContextSize ?? Math.Min(model.Config.NCtxTrain > 0 ? model.Config.NCtxTrain : 4096, 8192);
-        int kvTokens = _opt.KvCacheTokens ?? ContextSize * 2;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ContextSize);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_opt.BatchSize);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_opt.MaxConcurrentSequences);
+        int kvTokens = _opt.KvCacheTokens ?? checked(ContextSize * 2);
+        int pageCount = KvCache.PagesFor(kvTokens, _opt.KvPageSize);
         ILayerOffload? off = null;
         try
         {
             _pool = new ComputePool(_opt.Threads ?? ComputePool.DefaultThreadCount(), Resources);
-            int pageCount = Math.Max(1, (kvTokens + _opt.KvPageSize - 1) / _opt.KvPageSize);
-            var geometry = new OffloadGeometry(_opt.KvPageSize, pageCount, _opt.BatchSize) { LoggerFactory = LoggerFactory, Resources = Resources };
+            var geometry = new OffloadGeometry(_opt.KvPageSize, pageCount, _opt.BatchSize) { LoggerFactory = LoggerFactory, Resources = Resources, KvCacheType = _opt.KvCacheType };
             _offload = off = _opt.Offload != null ? _opt.Offload(model, geometry) : _opt.AutoAccelerator ? Accelerators.TryCreate(model, geometry) : null;
             _kv = new KvCache(model.Config, kvTokens, _opt.KvCacheType, _opt.KvPageSize, off == null ? null : l => !off.OwnsKv(l), off?.RecurrentStore);
             if (off != null) _kv.PageCopied += off.CopyPage;
@@ -560,6 +563,8 @@ public sealed class InferenceEngine : IDisposable
             if (seg is TokenSegment ts)
                 foreach (var t in ts.Tokens)
                 {
+                    if ((uint)t >= (uint)_model.TokenEmbedding.Rows || (uint)t >= (uint)Config.NVocab)
+                        throw new ArgumentException($"Prompt token {t} at position {pos} is outside the model vocabulary");
                     inputs.Add((t, null, mrope ? [ropePos, ropePos, ropePos, ropePos] : null));
                     pos++; ropePos++;
                 }

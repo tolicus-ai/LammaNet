@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Lamma.Net.Cli": {
+      "commandName": "Project",
+      "commandLineArgs": "agent D:\\Models\\granite-4.2-3b-Q4_K_M.gguf"
+    }
+  }
+}
